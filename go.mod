@@ -1,4 +1,4 @@
-module nomad-top
+module nomad-tui
 
 go 1.25.3
 

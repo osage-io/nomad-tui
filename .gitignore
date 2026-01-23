@@ -1,0 +1,16 @@
+# Binary
+nomad-tui
+
+# Local installation directories
+nomad-local/
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+*.swp
+
+# OS-specific files
+.DS_Store
+Thumbs.db

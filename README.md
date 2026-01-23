@@ -1,8 +1,8 @@
-# nomad-top
+# nomad-tui
 
 A beautiful, interactive terminal user interface (TUI) for monitoring and managing HashiCorp Nomad clusters.
 
-![nomad-top demo](screenshots/demo.gif)
+![nomad-tui demo](screenshots/demo.gif)
 <!-- TODO: Add demo GIF screenshot -->
 
 ## Features
@@ -51,20 +51,20 @@ A beautiful, interactive terminal user interface (TUI) for monitoring and managi
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/nomad-top.git
-cd nomad-top
+git clone https://github.com/yourusername/nomad-tui.git
+cd nomad-tui
 
 # Build the binary
-go build -o nomad-top .
+go build -o nomad-tui .
 
 # Optionally, move to your PATH
-sudo mv nomad-top /usr/local/bin/
+sudo mv nomad-tui /usr/local/bin/
 ```
 
 ### Using Go Install
 
 ```bash
-go install github.com/yourusername/nomad-top@latest
+go install github.com/yourusername/nomad-tui@latest
 ```
 
 ## Usage
@@ -73,19 +73,19 @@ go install github.com/yourusername/nomad-top@latest
 
 ```bash
 # Connect to default Nomad server (localhost:4646)
-./nomad-top
+./nomad-tui
 
 # Connect to a specific Nomad server
-./nomad-top -addr https://nomad.example.com:4646
+./nomad-tui -addr https://nomad.example.com:4646
 
 # Use ACL token authentication
-./nomad-top -addr https://nomad.example.com:4646 -token YOUR_TOKEN
+./nomad-tui -addr https://nomad.example.com:4646 -token YOUR_TOKEN
 
 # Skip TLS certificate verification (not recommended for production)
-./nomad-top -addr https://nomad.example.com:4646 -skip-verify
+./nomad-tui -addr https://nomad.example.com:4646 -skip-verify
 
 # Use a different color theme
-./nomad-top -theme vault
+./nomad-tui -theme vault
 ```
 
 ### Command-Line Options
@@ -99,14 +99,14 @@ go install github.com/yourusername/nomad-top@latest
 
 ### Environment Variables
 
-You can also configure nomad-top using environment variables:
+You can also configure nomad-tui using environment variables:
 
 ```bash
 export NOMAD_ADDR=https://nomad.example.com:4646
 export NOMAD_TOKEN=your-acl-token
 export NOMAD_SKIP_VERIFY=true  # Not recommended for production
 
-./nomad-top
+./nomad-tui
 ```
 
 ## Keyboard Shortcuts
@@ -257,7 +257,7 @@ The Node Details view displays:
 
 ## Color Themes
 
-nomad-top supports multiple color themes to match HashiCorp product branding:
+nomad-tui supports multiple color themes to match HashiCorp product branding:
 
 - **nomad** (default) - Purple theme matching Nomad branding
 - **vault** - Yellow/gold theme matching Vault
@@ -271,7 +271,7 @@ nomad-top supports multiple color themes to match HashiCorp product branding:
 Use the `-theme` flag to select your preferred theme:
 
 ```bash
-./nomad-top -theme vault
+./nomad-tui -theme vault
 ```
 
 ## Features in Detail
@@ -376,14 +376,14 @@ Monitor job events in real-time:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/nomad-top.git
-cd nomad-top
+git clone https://github.com/yourusername/nomad-tui.git
+cd nomad-tui
 
 # Install dependencies
 go mod download
 
 # Build
-go build -o nomad-top .
+go build -o nomad-tui .
 
 # Run tests (when available)
 go test ./...
@@ -418,7 +418,7 @@ Contributions are welcome! Please:
 
 ## Dependencies
 
-nomad-top is built with:
+nomad-tui is built with:
 
 - [Bubbletea](https://github.com/charmbracelet/bubbletea) - Terminal UI framework
 - [tcell](https://github.com/gdamore/tcell) - Terminal handling
@@ -436,9 +436,9 @@ nomad-top is built with:
 
 ## Support
 
-- Report bugs via [GitHub Issues](https://github.com/yourusername/nomad-top/issues)
-- Ask questions in [Discussions](https://github.com/yourusername/nomad-top/discussions)
-- Contribute improvements via [Pull Requests](https://github.com/yourusername/nomad-top/pulls)
+- Report bugs via [GitHub Issues](https://github.com/yourusername/nomad-tui/issues)
+- Ask questions in [Discussions](https://github.com/yourusername/nomad-tui/discussions)
+- Contribute improvements via [Pull Requests](https://github.com/yourusername/nomad-tui/pulls)
 
 ---
 

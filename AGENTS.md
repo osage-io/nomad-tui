@@ -34,7 +34,7 @@ go fmt .
 go vet .
 
 # Build the project
-go build -o nomad-top .
+go build -o nomad-tui .
 
 # Run tests (if any)
 go test ./...
@@ -61,7 +61,7 @@ find . -name "*.yaml" -o -name "*.yml" -exec yamllint {} \;
 
 ## Nomad Top Tool
 
-The `nomad-top` is a terminal user interface (TUI) for monitoring and managing Nomad clusters, built with Go and Bubbletea.
+The `nomad-tui` is a terminal user interface (TUI) for monitoring and managing Nomad clusters, built with Go and Bubbletea.
 
 ### Features
 - View Nomad jobs, nodes, and cluster overview
@@ -79,8 +79,8 @@ The `nomad-top` is a terminal user interface (TUI) for monitoring and managing N
 
 ### Building and Running
 ```bash
-go build -o nomad-top .
-./nomad-top [-addr <server>] [-token <token>] [-skip-verify] [-theme <theme>]
+go build -o nomad-tui .
+./nomad-tui [-addr <server>] [-token <token>] [-skip-verify] [-theme <theme>]
 ```
 
 ### Controls

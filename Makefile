@@ -1,8 +1,8 @@
-# Makefile for nomad-top
-# Description: Build and deploy the nomad-top TUI application
+# Makefile for nomad-tui
+# Description: Build and deploy the nomad-tui TUI application
 
 # Binary name
-BINARY := nomad-top
+BINARY := nomad-tui
 
 # Build variables
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")

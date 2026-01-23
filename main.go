@@ -2911,7 +2911,7 @@ func main() {
 	}
 
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
-		fmt.Println("nomad-top requires a terminal")
+		fmt.Println("nomad-tui requires a terminal")
 		os.Exit(1)
 	}
 
