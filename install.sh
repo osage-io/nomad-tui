@@ -118,13 +118,21 @@ install_nomad_tui() {
     # Create install directory if it doesn't exist
     if [ ! -d "$INSTALL_DIR" ]; then
         echo "Creating install directory: $INSTALL_DIR"
-        mkdir -p "$INSTALL_DIR"
+        if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+            echo -e "${YELLOW}Permission denied. Retrying with sudo...${NC}"
+            sudo mkdir -p "$INSTALL_DIR"
+        fi
     fi
     
     # Install binary
     echo "Installing to: ${INSTALL_DIR}/${BINARY_NAME}"
-    mv "${temp_dir}/${BINARY_NAME}-${platform}" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    if ! mv "${temp_dir}/${BINARY_NAME}-${platform}" "${INSTALL_DIR}/${BINARY_NAME}" 2>/dev/null; then
+        echo -e "${YELLOW}Permission denied. Retrying with sudo...${NC}"
+        sudo mv "${temp_dir}/${BINARY_NAME}-${platform}" "${INSTALL_DIR}/${BINARY_NAME}"
+        sudo chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    else
+        chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    fi
     
     echo ""
     echo -e "${GREEN}✓ Installation complete!${NC}"
