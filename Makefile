@@ -17,7 +17,7 @@ GOVET := $(GOCMD) vet
 GOTEST := $(GOCMD) test
 GOMOD := $(GOCMD) mod
 
-.PHONY: all build clean fmt vet test tidy deploy help
+.PHONY: all build clean fmt vet test tidy deploy release help
 
 # Default target
 all: fmt vet build
@@ -96,6 +96,66 @@ deploy: build
 		echo "Installed: $$dest/$(BINARY)"; \
 	fi
 
+# Interactive release workflow
+release:
+	@echo "=== Release Workflow ==="
+	@echo ""
+	@latest=$$(git describe --tags --abbrev=0 2>/dev/null || echo "No tags yet"); \
+	echo "Current latest tag: $$latest"; \
+	echo ""; \
+	if git status --porcelain | grep -q .; then \
+		echo "WARNING: You have uncommitted changes:"; \
+		git status --short; \
+		echo ""; \
+		read -p "Do you want to commit these changes first? [y/N]: " commit_choice; \
+		if [ "$$commit_choice" = "y" ] || [ "$$commit_choice" = "Y" ]; then \
+			echo "Please commit your changes and run 'make release' again."; \
+			exit 1; \
+		fi; \
+	fi; \
+	echo ""; \
+	read -p "Enter new version tag (e.g., v1.0.0): " new_tag; \
+	if [ -z "$$new_tag" ]; then \
+		echo "No tag provided. Exiting."; \
+		exit 1; \
+	fi; \
+	if ! echo "$$new_tag" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+'; then \
+		echo "WARNING: Tag should follow semantic versioning (e.g., v1.0.0)"; \
+		read -p "Continue anyway? [y/N]: " continue; \
+		if [ "$$continue" != "y" ] && [ "$$continue" != "Y" ]; then \
+			echo "Cancelled."; \
+			exit 1; \
+		fi; \
+	fi; \
+	if git rev-parse "$$new_tag" >/dev/null 2>&1; then \
+		echo "ERROR: Tag $$new_tag already exists!"; \
+		exit 1; \
+	fi; \
+	echo ""; \
+	echo "Summary:"; \
+	echo "  Previous tag: $$latest"; \
+	echo "  New tag:      $$new_tag"; \
+	echo ""; \
+	echo "This will:"; \
+	echo "  1. Create tag $$new_tag"; \
+	echo "  2. Push tag to origin"; \
+	echo "  3. Trigger GitHub Actions to build and release"; \
+	echo ""; \
+	read -p "Proceed with release? [y/N]: " confirm; \
+	if [ "$$confirm" = "y" ] || [ "$$confirm" = "Y" ]; then \
+		echo "Creating tag $$new_tag..."; \
+		git tag -a "$$new_tag" -m "Release $$new_tag" || exit 1; \
+		echo "Pushing tag to origin..."; \
+		git push origin "$$new_tag" || exit 1; \
+		echo ""; \
+		echo "✓ Release $$new_tag created and pushed!"; \
+		echo ""; \
+		echo "GitHub Actions will now build the release."; \
+		echo "Check: https://github.com/osage-io/nomad-tui/actions"; \
+	else \
+		echo "Release cancelled."; \
+	fi
+
 # Help target
 help:
 	@echo "Usage: make [TARGET]"
@@ -109,6 +169,7 @@ help:
 	@echo "  test     Run tests"
 	@echo "  tidy     Tidy go module dependencies"
 	@echo "  deploy   Build and install binary (interactive prompt)"
+	@echo "  release  Interactive release workflow (tag and push)"
 	@echo "  help     Show this help message"
 	@echo ""
 	@echo "Environment variables:"

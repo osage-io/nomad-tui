@@ -42,16 +42,54 @@ A beautiful, interactive terminal user interface (TUI) for monitoring and managi
 
 ## Installation
 
-### Prerequisites
+### Quick Install (Recommended)
 
-- Go 1.25.3 or later
-- Access to a Nomad cluster
+Install the latest release with a single command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/osage-io/nomad-tui/main/install.sh | bash
+```
+
+This will automatically:
+- Detect your operating system and architecture
+- Download the appropriate binary
+- Install to `~/.local/bin/nomad-tui`
+- Make the binary executable
+
+**Custom install location:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/osage-io/nomad-tui/main/install.sh | INSTALL_DIR=/usr/local/bin bash
+```
+
+### Manual Download
+
+Download the latest release for your platform from the [releases page](https://github.com/osage-io/nomad-tui/releases/latest):
+
+- **Linux AMD64**: `nomad-tui-VERSION-linux-amd64.tar.gz`
+- **Linux ARM64**: `nomad-tui-VERSION-linux-arm64.tar.gz`
+- **macOS Intel**: `nomad-tui-VERSION-darwin-amd64.tar.gz`
+- **macOS Apple Silicon**: `nomad-tui-VERSION-darwin-arm64.tar.gz`
+
+```bash
+# Download and extract (replace VERSION and PLATFORM)
+curl -LO https://github.com/osage-io/nomad-tui/releases/download/VERSION/nomad-tui-VERSION-PLATFORM.tar.gz
+tar -xzf nomad-tui-VERSION-PLATFORM.tar.gz
+
+# Move to your PATH
+mv nomad-tui-PLATFORM /usr/local/bin/nomad-tui
+chmod +x /usr/local/bin/nomad-tui
+```
 
 ### From Source
 
+**Prerequisites:**
+- Go 1.21 or later
+- Access to a Nomad cluster
+
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/nomad-tui.git
+git clone https://github.com/osage-io/nomad-tui.git
 cd nomad-tui
 
 # Build the binary
@@ -64,7 +102,7 @@ sudo mv nomad-tui /usr/local/bin/
 ### Using Go Install
 
 ```bash
-go install github.com/yourusername/nomad-tui@latest
+go install github.com/osage-io/nomad-tui@latest
 ```
 
 ## Usage
@@ -376,7 +414,7 @@ Monitor job events in real-time:
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/nomad-tui.git
+git clone https://github.com/osage-io/nomad-tui.git
 cd nomad-tui
 
 # Install dependencies
@@ -436,9 +474,9 @@ nomad-tui is built with:
 
 ## Support
 
-- Report bugs via [GitHub Issues](https://github.com/yourusername/nomad-tui/issues)
-- Ask questions in [Discussions](https://github.com/yourusername/nomad-tui/discussions)
-- Contribute improvements via [Pull Requests](https://github.com/yourusername/nomad-tui/pulls)
+- Report bugs via [GitHub Issues](https://github.com/osage-io/nomad-tui/issues)
+- Ask questions in [Discussions](https://github.com/osage-io/nomad-tui/discussions)
+- Contribute improvements via [Pull Requests](https://github.com/osage-io/nomad-tui/pulls)
 
 ---
 
