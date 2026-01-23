@@ -93,6 +93,10 @@ type model struct {
 	eventsList           []jobEvent
 	eventsJobName        string
 	scrollOffset         int  // scroll offset for scrollable views (job-status, node-status, cluster)
+	helpScrollOffset     int  // scroll offset for help view
+	jobsScrollOffset     int  // scroll offset for jobs list view
+	nodesScrollOffset    int  // scroll offset for nodes list view
+	servicesScrollOffset int  // scroll offset for services list view
 	allocSelectMode      bool // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
 }
 
@@ -773,6 +777,79 @@ func truncate(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+// calculateColumnWidths distributes available width among columns proportionally
+// weights defines the relative width of each column (e.g., []int{3, 2, 1, 2} means first col gets 3/8 of space)
+// minWidths defines minimum width for each column
+// availableWidth is the total width available for the table content (excluding borders/padding)
+func calculateColumnWidths(availableWidth int, weights []int, minWidths []int) []int {
+	numCols := len(weights)
+	if numCols == 0 {
+		return []int{}
+	}
+
+	// Calculate total weight
+	totalWeight := 0
+	for _, w := range weights {
+		totalWeight += w
+	}
+
+	// Calculate proportional widths
+	widths := make([]int, numCols)
+	totalMinWidth := 0
+	for i, min := range minWidths {
+		totalMinWidth += min
+		widths[i] = min
+	}
+
+	// If available width is less than minimum, just use minimums
+	if availableWidth <= totalMinWidth {
+		return widths
+	}
+
+	// Distribute remaining width proportionally
+	remainingWidth := availableWidth - totalMinWidth
+	for i, weight := range weights {
+		extra := (remainingWidth * weight) / totalWeight
+		widths[i] += extra
+	}
+
+	// Distribute any rounding remainder to the first column
+	totalAllocated := 0
+	for _, w := range widths {
+		totalAllocated += w
+	}
+	if totalAllocated < availableWidth {
+		widths[0] += availableWidth - totalAllocated
+	}
+
+	return widths
+}
+
+// getTableWidth returns the available width for table content
+// Accounts for: 2 chars left margin + border chars between/around columns
+func getTableWidth(termWidth int, numColumns int) int {
+	// 2 for left margin "  ", 1 for each column border (numColumns + 1 total)
+	overhead := 2 + numColumns + 1
+	available := termWidth - overhead
+	if available < numColumns*4 { // minimum 4 chars per column
+		return numColumns * 4
+	}
+	return available
+}
+
+// getBoxWidth returns the width for header boxes based on terminal width
+func getBoxWidth(termWidth int) int {
+	// Leave some margin: 2 left + 2 right
+	boxWidth := termWidth - 6
+	if boxWidth < 40 {
+		boxWidth = 40
+	}
+	if boxWidth > 120 {
+		boxWidth = 120 // cap at reasonable max
+	}
+	return boxWidth
+}
+
 func formatAllocStatuses(statuses map[string]int) string {
 	if len(statuses) == 0 {
 		return ""
@@ -878,16 +955,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.showHelp {
 			switch key {
-			case "h":
+			case "h", "esc":
 				m.showHelp = false
+				m.helpScrollOffset = 0
 				return m, tea.ClearScreen
 			case "q", "ctrl+c":
 				return m, tea.Quit
+			case "up":
+				if m.helpScrollOffset > 0 {
+					m.helpScrollOffset--
+				}
+				return m, nil
+			case "down":
+				m.helpScrollOffset++
+				return m, nil
 			case "j":
 				m.showHelp = false
+				m.helpScrollOffset = 0
 				m.view = "jobs"
 			case "n":
 				m.showHelp = false
+				m.helpScrollOffset = 0
 				m.view = "nodes"
 			case "r":
 				return m, tea.Cmd(func() tea.Msg { return fetchData(m.client) })
@@ -979,12 +1067,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up":
 			if m.view == "jobs" && m.selectedIndex > 0 {
 				m.selectedIndex--
+				// Scroll up if selection is above visible area
+				if m.selectedIndex < m.jobsScrollOffset {
+					m.jobsScrollOffset = m.selectedIndex
+				}
 			}
 			if m.view == "nodes" && m.selectedNodeIndex > 0 {
 				m.selectedNodeIndex--
+				// Scroll up if selection is above visible area
+				if m.selectedNodeIndex < m.nodesScrollOffset {
+					m.nodesScrollOffset = m.selectedNodeIndex
+				}
 			}
 			if m.view == "services" && m.selectedServiceIndex > 0 {
 				m.selectedServiceIndex--
+				// Scroll up if selection is above visible area
+				if m.selectedServiceIndex < m.servicesScrollOffset {
+					m.servicesScrollOffset = m.selectedServiceIndex
+				}
 			}
 			if m.view == "job-status" {
 				if m.allocSelectMode {
@@ -1005,12 +1105,52 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down":
 			if m.view == "jobs" && m.selectedIndex < len(m.jobs)-1 {
 				m.selectedIndex++
+				// Calculate max visible jobs (same formula as in View)
+				// Chrome = 15 lines (10 before table + 5 after)
+				if m.height > 0 {
+					chromeLines := 15
+					maxVisibleJobs := m.height - chromeLines
+					if maxVisibleJobs < 1 {
+						maxVisibleJobs = 1
+					}
+					// Scroll down if selection is within 2 lines of bottom of visible area
+					scrollBuffer := 2
+					if m.selectedIndex >= m.jobsScrollOffset+maxVisibleJobs-scrollBuffer {
+						m.jobsScrollOffset = m.selectedIndex - maxVisibleJobs + scrollBuffer + 1
+					}
+				}
 			}
 			if m.view == "nodes" && m.selectedNodeIndex < len(m.nodes)-1 {
 				m.selectedNodeIndex++
+				// Calculate max visible nodes (same chrome as jobs = 15 lines)
+				if m.height > 0 {
+					chromeLines := 15
+					maxVisibleNodes := m.height - chromeLines
+					if maxVisibleNodes < 1 {
+						maxVisibleNodes = 1
+					}
+					// Scroll down if selection is within 2 lines of bottom of visible area
+					scrollBuffer := 2
+					if m.selectedNodeIndex >= m.nodesScrollOffset+maxVisibleNodes-scrollBuffer {
+						m.nodesScrollOffset = m.selectedNodeIndex - maxVisibleNodes + scrollBuffer + 1
+					}
+				}
 			}
 			if m.view == "services" && m.selectedServiceIndex < len(m.services)-1 {
 				m.selectedServiceIndex++
+				// Calculate max visible services (same chrome as jobs = 15 lines)
+				if m.height > 0 {
+					chromeLines := 15
+					maxVisibleServices := m.height - chromeLines
+					if maxVisibleServices < 1 {
+						maxVisibleServices = 1
+					}
+					// Scroll down if selection is within 2 lines of bottom of visible area
+					scrollBuffer := 2
+					if m.selectedServiceIndex >= m.servicesScrollOffset+maxVisibleServices-scrollBuffer {
+						m.servicesScrollOffset = m.selectedServiceIndex - maxVisibleServices + scrollBuffer + 1
+					}
+				}
 			}
 			if m.view == "job-status" {
 				if m.allocSelectMode {
@@ -1198,20 +1338,26 @@ func (m model) View() string {
 	if m.height < 10 {
 		return "Terminal height too small. Please resize to at least 10 lines.\n"
 	}
+
+	// Common styling used across views
+	reset := "\033[0m"
+	bold := "\033[1m"
+	dimmed := "\033[2m"
+	cyan := "\033[36m"
+
+	// Dynamic box width based on terminal width
+	boxWidth := getBoxWidth(m.width)
+
 	content := ""
 	if m.showHelp {
 		// Colors for help page
-		reset := "\033[0m"
-		bold := "\033[1m"
-		cyan := "\033[36m"
 		yellow := "\033[33m"
 		green := "\033[32m"
 		red := "\033[31m"
-		dimmed := "\033[2m"
 		keyColor := "\033[1;36m" // bold cyan for keys
 
-		help := "\n"
-		help += renderHeader("❓ KEYBOARD SHORTCUTS", 88, m.theme.Header, bold, reset) + "\n"
+		// Build help content (without header/footer - those are added separately)
+		var helpLines []string
 
 		// Column widths for tables
 		colKey := 10
@@ -1233,170 +1379,241 @@ func (m model) View() string {
 		// === ROW 1: NAVIGATION header / JOB ACTIONS header ===
 		leftRow := "  " + bold + cyan + "NAVIGATION" + reset
 		rightRow := bold + cyan + "JOB ACTIONS" + reset + "  " + dimmed + "(jobs view)" + reset
-		help += padLeft(leftRow, 12) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, 12)+gap+rightRow)
 
 		// === ROW 2: NAVIGATION top border / JOB ACTIONS top border ===
 		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
 		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 3: Column headers ===
 		leftRow = "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 4: Separators ===
 		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
 		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 5: j / Enter ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "j") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Switch to jobs view") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "Enter") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "View job details") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 6: n / s ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "n") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Switch to nodes view") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "s") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Stop selected job") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 7: v / d ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "v") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Switch to services view") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "d") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Delete selected job") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 8: c / l ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "c") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Switch to cluster view") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "l") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "View job logs") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 9: ← → / e ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "← →") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Cycle through views") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "e") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "View job events") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 10: ↑ ↓ / bottom of JOB ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "↑ ↓") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Navigate list items") + dimmed + "│" + reset
 		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 11: bottom of NAVIGATION / empty ===
 		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		help += padLeft(leftRow, leftVisualWidth) + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 12: empty ===
-		help += "\n"
+		helpLines = append(helpLines, "")
 
 		// === ROW 13: GENERAL header / NODE ACTIONS header ===
 		leftRow = "  " + bold + cyan + "GENERAL" + reset
 		rightRow = bold + cyan + "NODE ACTIONS" + reset + "  " + dimmed + "(nodes view)" + reset
-		help += padLeft(leftRow, 9) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, 9)+gap+rightRow)
 
 		// === ROW 14: GENERAL top border / NODE ACTIONS top border ===
 		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
 		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 15: Column headers ===
 		leftRow = "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 16: Separators ===
 		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
 		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 17: r / Enter ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "r") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Refresh data") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "Enter") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "View node details") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 18: b / bottom of NODE ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "b") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Go back to previous view") + dimmed + "│" + reset
 		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		help += padLeft(leftRow, leftVisualWidth) + gap + rightRow + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 19: h / empty ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "h") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Toggle this help screen") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 20: q / empty ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "q") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Quit application") + dimmed + "│" + reset
-		help += padLeft(leftRow, leftVisualWidth) + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 21: bottom of GENERAL / empty ===
 		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		help += padLeft(leftRow, leftVisualWidth) + "\n"
+		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 22: empty ===
-		help += "\n"
+		helpLines = append(helpLines, "")
 
 		// === ROW 23: STATUS COLORS header / SERVICE ACTIONS header ===
 		colColor := 10
 		colMeaning := 22
-		// STATUS COLORS table width: 2 + 1 + colColor + 1 + colMeaning + 1 = 36
-		// Standard table width: 2 + 1 + colKey + 1 + colDesc + 1 = 42
-		// Difference: 6 characters - need to pad STATUS COLORS to align SERVICE ACTIONS
-		statusColorsWidth := 2 + 1 + colColor + 1 + colMeaning + 1 // 36
-		extraPad := leftVisualWidth - statusColorsWidth            // 6
+		statusColorsWidth := 2 + 1 + colColor + 1 + colMeaning + 1
+		extraPad := leftVisualWidth - statusColorsWidth
 
 		leftRow = "  " + bold + cyan + "STATUS COLORS" + reset
 		rightRow = bold + cyan + "SERVICE ACTIONS" + reset + "  " + dimmed + "(services view)" + reset
-		// Pad STATUS COLORS header (15 chars visual) to align with table width (36) + extraPad
-		help += leftRow + strings.Repeat(" ", statusColorsWidth-15+extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", statusColorsWidth-15+extraPad)+gap+rightRow)
 
 		// === ROW 24: STATUS COLORS top border / SERVICE ACTIONS top border ===
 		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colColor) + "┬" + strings.Repeat("─", colMeaning) + "╮" + reset
 		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		help += leftRow + strings.Repeat(" ", extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 25: Column headers ===
 		leftRow = "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colColor-1, "Color") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colMeaning-1, "Meaning") + reset + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
-		help += leftRow + strings.Repeat(" ", extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 26: Separators ===
 		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colColor) + "┼" + strings.Repeat("─", colMeaning) + "┤" + reset
 		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		help += leftRow + strings.Repeat(" ", extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 27: Green / ↑ ↓ ===
 		leftRow = "  " + dimmed + "│" + reset + " " + green + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Green") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Running / Ready") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "↑ ↓") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Navigate services") + dimmed + "│" + reset
-		help += leftRow + strings.Repeat(" ", extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 28: Yellow / bottom of SERVICE ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + yellow + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Yellow") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Pending") + dimmed + "│" + reset
 		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		help += leftRow + strings.Repeat(" ", extraPad) + gap + rightRow + "\n"
+		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 29: Red / empty ===
 		leftRow = "  " + dimmed + "│" + reset + " " + red + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Red") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Dead / Failed") + dimmed + "│" + reset
-		help += leftRow + "\n"
+		helpLines = append(helpLines, leftRow)
 
 		// === ROW 30: bottom of STATUS COLORS ===
 		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colColor) + "┴" + strings.Repeat("─", colMeaning) + "╯" + reset
-		help += leftRow + "\n"
+		helpLines = append(helpLines, leftRow)
 
-		// Footer navigation bar (matching other pages)
-		help += "\n  " + cyan + "h" + reset + " Close Help  " + dimmed + "│" + reset + "  " + cyan + "q" + reset + " Quit\n"
+		// === ROW 31: empty for spacing ===
+		helpLines = append(helpLines, "")
 
-		return help
+		// === ROW 32: ALLOCATION ACTIONS header ===
+		helpLines = append(helpLines, "  "+bold+cyan+"ALLOCATION ACTIONS"+reset+"  "+dimmed+"(job-status view, press 'a' to enter alloc mode)"+reset)
+
+		// === ROW 33: ALLOCATION ACTIONS top border ===
+		helpLines = append(helpLines, "  "+dimmed+"╭"+strings.Repeat("─", colKey)+"┬"+strings.Repeat("─", colDesc)+"╮"+reset)
+
+		// === ROW 34: Column headers ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+bold+fmt.Sprintf("%-*s", colKey-1, "Key")+reset+dimmed+"│"+reset+" "+bold+fmt.Sprintf("%-*s", colDesc-1, "Action")+reset+dimmed+"│"+reset)
+
+		// === ROW 35: Separator ===
+		helpLines = append(helpLines, "  "+dimmed+"├"+strings.Repeat("─", colKey)+"┼"+strings.Repeat("─", colDesc)+"┤"+reset)
+
+		// === ROW 36: a ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "a")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "Toggle alloc select mode")+dimmed+"│"+reset)
+
+		// === ROW 37: ↑ ↓ ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "↑ ↓")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "Navigate allocations")+dimmed+"│"+reset)
+
+		// === ROW 38: s ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "s")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "Stop selected allocation")+dimmed+"│"+reset)
+
+		// === ROW 39: x ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "x")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "Restart selected allocation")+dimmed+"│"+reset)
+
+		// === ROW 40: l ===
+		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "l")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "View allocation logs")+dimmed+"│"+reset)
+
+		// === ROW 41: bottom border ===
+		helpLines = append(helpLines, "  "+dimmed+"╰"+strings.Repeat("─", colKey)+"┴"+strings.Repeat("─", colDesc)+"╯"+reset)
+
+		// Build header (no leading newline to avoid cutting off top border)
+		header := renderHeader("❓ KEYBOARD SHORTCUTS", boxWidth, m.theme.Header, bold, reset) + "\n"
+
+		// Build footer
+		footerHint := "  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "h" + reset + "/" + cyan + "Esc" + reset + " Close Help"
+		plainFooter := "Press 'h' for help, 'q' for quit"
+		footerLen := len(plainFooter)
+		leftPad := (m.width - footerLen) / 2
+		if leftPad < 0 {
+			leftPad = 0
+		}
+		rightPad := m.width - leftPad - footerLen
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		footerBar := "\033[48;5;237m" + "\033[37m" + strings.Repeat(" ", leftPad) + "Press '\033[38;5;51mh\033[37m' for help, '\033[38;5;204mq\033[37m' for quit" + strings.Repeat(" ", rightPad) + "\033[0m"
+
+		// Calculate visible content area
+		// Header takes ~5 lines, footer hint + separator + footer bar = 3 lines
+		headerLines := strings.Count(header, "\n")
+		footerLines := 3
+		visibleContentLines := m.height - headerLines - footerLines
+		if visibleContentLines < 1 {
+			visibleContentLines = 1
+		}
+
+		// Clamp scroll offset
+		maxScroll := len(helpLines) - visibleContentLines
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.helpScrollOffset > maxScroll {
+			m.helpScrollOffset = maxScroll
+		}
+		if m.helpScrollOffset < 0 {
+			m.helpScrollOffset = 0
+		}
+
+		// Get visible slice of help content
+		endLine := m.helpScrollOffset + visibleContentLines
+		if endLine > len(helpLines) {
+			endLine = len(helpLines)
+		}
+		visibleHelp := helpLines[m.helpScrollOffset:endLine]
+
+		// Build final output
+		result := header
+		result += strings.Join(visibleHelp, "\n") + "\n"
+		result += "\n" + footerHint + "\n"
+		result += strings.Repeat("─", m.width) + "\n"
+		result += footerBar + "\n"
+
+		return result
 	}
 	if m.err != nil {
 		return fmt.Sprintf("Error: %v\n", m.err)
 	}
 
 	// Common styling
-	reset := "\033[0m"
-	bold := "\033[1m"
-	dimmed := "\033[2m"
-	cyan := "\033[36m"
 	white := "\033[37m"
-
-	// Standard box width for all headers
-	boxWidth := 98
 
 	switch m.view {
 	case "jobs":
@@ -1422,31 +1639,55 @@ func (m model) View() string {
 		content += "  │  " + m.theme.Pending + "●" + reset + " Pending: " + bold + fmt.Sprintf("%d", pendingCount) + reset
 		content += "  │  " + m.theme.Dead + "●" + reset + " Dead: " + bold + fmt.Sprintf("%d", deadCount) + reset + "\n\n"
 
-		// Column widths (content width, not including borders)
-		colName := 26
-		colStatus := 14
-		colType := 10
-		colPool := 12
-		colUptime := 14
-		colAlloc := 16
+		// Calculate dynamic column widths based on terminal width
+		// Jobs table has 5 columns: Name, Status, Type, Pool, Uptime
+		// Weights: Name(4), Status(2), Type(1), Pool(2), Uptime(2) = 11 total parts
+		tableWidth := getTableWidth(m.width, 5)
+		jobColWidths := calculateColumnWidths(tableWidth, []int{4, 2, 1, 2, 2}, []int{12, 10, 6, 8, 10})
+		colName := jobColWidths[0]
+		colStatus := jobColWidths[1]
+		colType := jobColWidths[2]
+		colPool := jobColWidths[3]
+		colUptime := jobColWidths[4]
 
 		// Table header with rounded corners
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colType) + "┬" + strings.Repeat("─", colPool) + "┬" + strings.Repeat("─", colUptime) + "┬" + strings.Repeat("─", colAlloc) + "╮" + reset + "\n"
-		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Job Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPool-1, "Node Pool") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colUptime-1, "Uptime") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAlloc-1, "Allocations") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colType) + "┼" + strings.Repeat("─", colPool) + "┼" + strings.Repeat("─", colUptime) + "┼" + strings.Repeat("─", colAlloc) + "┤" + reset + "\n"
+		content += "  " + dimmed + "╭" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colType) + "┬" + strings.Repeat("─", colPool) + "┬" + strings.Repeat("─", colUptime) + "╮" + reset + "\n"
+		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Job Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPool-1, "Node Pool") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colUptime-1, "Uptime") + reset + dimmed + "│" + reset + "\n"
+		content += "  " + dimmed + "├" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colType) + "┼" + strings.Repeat("─", colPool) + "┼" + strings.Repeat("─", colUptime) + "┤" + reset + "\n"
 
-		maxJobs := len(m.jobs)
+		// Calculate how many jobs can be displayed
+		// Chrome lines breakdown:
+		// Before table: 1 (leading \n) + 4 (header box + \n) + 2 (summary + blank) + 3 (table header) = 10
+		// After table: 1 (table bottom) + 2 (nav hint) + 1 (separator) + 1 (footer) = 5
+		// Total chrome = 15 lines
+		chromeLines := 15
+		maxVisibleJobs := len(m.jobs)
 		if m.height > 0 {
-			maxJobs = m.height - 12
-			if maxJobs < 0 {
-				maxJobs = 0
-			}
-			if maxJobs > len(m.jobs) {
-				maxJobs = len(m.jobs)
+			maxVisibleJobs = m.height - chromeLines
+			if maxVisibleJobs < 1 {
+				maxVisibleJobs = 1
 			}
 		}
 
-		for i := 0; i < maxJobs; i++ {
+		// Clamp scroll offset
+		maxScroll := len(m.jobs) - maxVisibleJobs
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.jobsScrollOffset > maxScroll {
+			m.jobsScrollOffset = maxScroll
+		}
+		if m.jobsScrollOffset < 0 {
+			m.jobsScrollOffset = 0
+		}
+
+		// Calculate end index for visible jobs
+		endIndex := m.jobsScrollOffset + maxVisibleJobs
+		if endIndex > len(m.jobs) {
+			endIndex = len(m.jobs)
+		}
+
+		for i := m.jobsScrollOffset; i < endIndex; i++ {
 			job := m.jobs[i]
 
 			// Job name with selection highlight
@@ -1485,25 +1726,19 @@ func (m model) View() string {
 			durationStr := fmt.Sprintf("%dd %dh %dm", int(duration.Hours()/24), int(duration.Hours())%24, int(duration.Minutes())%60)
 			durationField := " " + fmt.Sprintf("%-*s", colUptime-1, durationStr)
 
-			// Allocations summary (simple count)
-			totalAllocs := 0
-			for _, count := range job.allocStatuses {
-				totalAllocs += count
-			}
-			var allocField string
-			if totalAllocs == 0 {
-				allocField = " " + dimmed + fmt.Sprintf("%-*s", colAlloc-1, "none") + reset
-			} else {
-				allocField = " " + fmt.Sprintf("%-*d", colAlloc-1, totalAllocs)
-			}
-
-			content += "  " + dimmed + "│" + reset + nameField + dimmed + "│" + reset + statusField + dimmed + "│" + reset + typeField + dimmed + "│" + reset + nodePoolField + dimmed + "│" + reset + durationField + dimmed + "│" + reset + allocField + dimmed + "│" + reset + "\n"
+			content += "  " + dimmed + "│" + reset + nameField + dimmed + "│" + reset + statusField + dimmed + "│" + reset + typeField + dimmed + "│" + reset + nodePoolField + dimmed + "│" + reset + durationField + dimmed + "│" + reset + "\n"
 		}
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colType) + "┴" + strings.Repeat("─", colPool) + "┴" + strings.Repeat("─", colUptime) + "┴" + strings.Repeat("─", colAlloc) + "╯" + reset + "\n"
+		content += "  " + dimmed + "╰" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colType) + "┴" + strings.Repeat("─", colPool) + "┴" + strings.Repeat("─", colUptime) + "╯" + reset + "\n"
+
+		// Scroll indicator (if list is scrollable)
+		scrollIndicator := ""
+		if len(m.jobs) > maxVisibleJobs {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.jobsScrollOffset+1, endIndex, len(m.jobs), reset)
+		}
 
 		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete  " + scrollIndicator + "\n"
 
 	case "nodes":
 		// Header
@@ -1523,32 +1758,54 @@ func (m model) View() string {
 		content += "  │  " + m.theme.Running + "●" + reset + " Ready: " + bold + fmt.Sprintf("%d", readyCount) + reset
 		content += "  │  " + m.theme.Dead + "●" + reset + " Down: " + bold + fmt.Sprintf("%d", downCount) + reset + "\n\n"
 
-		// Column widths
-		colID := 10
-		colName := 20
-		colDC := 8
-		colOS := 16
-		colStatus := 10
-		colVersion := 14
-		colIP := 16
+		// Calculate dynamic column widths based on terminal width
+		// Nodes table has 7 columns: ID, Name, DC, OS, Status, Version, IP
+		// Weights: ID(1), Name(3), DC(1), OS(2), Status(1), Version(2), IP(2) = 12 total parts
+		tableWidth := getTableWidth(m.width, 7)
+		nodeColWidths := calculateColumnWidths(tableWidth, []int{1, 3, 1, 2, 1, 2, 2}, []int{8, 12, 6, 10, 8, 10, 12})
+		colID := nodeColWidths[0]
+		colName := nodeColWidths[1]
+		colDC := nodeColWidths[2]
+		colOS := nodeColWidths[3]
+		colStatus := nodeColWidths[4]
+		colVersion := nodeColWidths[5]
+		colIP := nodeColWidths[6]
 
 		// Table header with rounded corners
 		content += "  " + dimmed + "╭" + strings.Repeat("─", colID) + "┬" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colDC) + "┬" + strings.Repeat("─", colOS) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colVersion) + "┬" + strings.Repeat("─", colIP) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colID-1, "ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDC-1, "DC") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colOS-1, "OS") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colVersion-1, "Version") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colIP-1, "IP") + reset + dimmed + "│" + reset + "\n"
 		content += "  " + dimmed + "├" + strings.Repeat("─", colID) + "┼" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colDC) + "┼" + strings.Repeat("─", colOS) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colVersion) + "┼" + strings.Repeat("─", colIP) + "┤" + reset + "\n"
 
-		maxNodes := len(m.nodes)
+		// Calculate how many nodes can be displayed
+		// Chrome lines breakdown: same as jobs = 15 lines
+		chromeLines := 15
+		maxVisibleNodes := len(m.nodes)
 		if m.height > 0 {
-			maxNodes = m.height - 12
-			if maxNodes < 0 {
-				maxNodes = 0
-			}
-			if maxNodes > len(m.nodes) {
-				maxNodes = len(m.nodes)
+			maxVisibleNodes = m.height - chromeLines
+			if maxVisibleNodes < 1 {
+				maxVisibleNodes = 1
 			}
 		}
 
-		for i := 0; i < maxNodes; i++ {
+		// Clamp scroll offset
+		maxScroll := len(m.nodes) - maxVisibleNodes
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.nodesScrollOffset > maxScroll {
+			m.nodesScrollOffset = maxScroll
+		}
+		if m.nodesScrollOffset < 0 {
+			m.nodesScrollOffset = 0
+		}
+
+		// Calculate end index for visible nodes
+		endIndex := m.nodesScrollOffset + maxVisibleNodes
+		if endIndex > len(m.nodes) {
+			endIndex = len(m.nodes)
+		}
+
+		for i := m.nodesScrollOffset; i < endIndex; i++ {
 			node := m.nodes[i]
 
 			// ID (first part)
@@ -1604,8 +1861,14 @@ func (m model) View() string {
 
 		content += "  " + dimmed + "╰" + strings.Repeat("─", colID) + "┴" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colDC) + "┴" + strings.Repeat("─", colOS) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colVersion) + "┴" + strings.Repeat("─", colIP) + "╯" + reset + "\n"
 
+		// Scroll indicator (if list is scrollable)
+		scrollIndicator := ""
+		if len(m.nodes) > maxVisibleNodes {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.nodesScrollOffset+1, endIndex, len(m.nodes), reset)
+		}
+
 		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + scrollIndicator + "\n"
 
 	case "cluster":
 		// Header
@@ -1635,10 +1898,13 @@ func (m model) View() string {
 			}
 		}
 
-		// Summary table
-		colLabel := 12
-		colValue := 10
-		colStatus := 24
+		// Calculate dynamic column widths for cluster status table
+		// 3 columns: Label, Value, Status
+		clusterTableWidth := getTableWidth(m.width, 3)
+		clusterColWidths := calculateColumnWidths(clusterTableWidth, []int{2, 1, 3}, []int{10, 8, 18})
+		colLabel := clusterColWidths[0]
+		colValue := clusterColWidths[1]
+		colStatus := clusterColWidths[2]
 
 		content += "  " + bold + cyan + "CLUSTER STATUS" + reset + "\n"
 		content += "  " + dimmed + "╭" + strings.Repeat("─", colLabel) + "┬" + strings.Repeat("─", colValue) + "┬" + strings.Repeat("─", colStatus) + "╮" + reset + "\n"
@@ -1708,12 +1974,15 @@ func (m model) View() string {
 			memColor = m.theme.UtilMedium
 		}
 
-		// Resources table
-		colResource := 10
-		colCapacity := 14
-		colAllocated := 14
-		colAvailable := 14
-		colUtil := 10
+		// Calculate dynamic column widths for resource utilization table
+		// 5 columns: Resource, Capacity, Allocated, Available, Util
+		resTableWidth := getTableWidth(m.width, 5)
+		resColWidths := calculateColumnWidths(resTableWidth, []int{2, 2, 2, 2, 1}, []int{8, 10, 10, 10, 8})
+		colResource := resColWidths[0]
+		colCapacity := resColWidths[1]
+		colAllocated := resColWidths[2]
+		colAvailable := resColWidths[3]
+		colUtil := resColWidths[4]
 
 		content += "  " + bold + cyan + "RESOURCE UTILIZATION" + reset + "\n"
 		content += "  " + dimmed + "╭" + strings.Repeat("─", colResource) + "┬" + strings.Repeat("─", colCapacity) + "┬" + strings.Repeat("─", colAllocated) + "┬" + strings.Repeat("─", colAvailable) + "┬" + strings.Repeat("─", colUtil) + "╮" + reset + "\n"
@@ -1730,8 +1999,14 @@ func (m model) View() string {
 
 		content += "  " + dimmed + "╰" + strings.Repeat("─", colResource) + "┴" + strings.Repeat("─", colCapacity) + "┴" + strings.Repeat("─", colAllocated) + "┴" + strings.Repeat("─", colAvailable) + "┴" + strings.Repeat("─", colUtil) + "╯" + reset + "\n\n"
 
-		// Progress bars section
-		barWidth := 40
+		// Progress bars section - dynamic width based on terminal
+		barWidth := m.width - 20 // Leave room for label and percentage
+		if barWidth < 20 {
+			barWidth = 20
+		}
+		if barWidth > 60 {
+			barWidth = 60
+		}
 
 		content += "  " + bold + cyan + "UTILIZATION" + reset + "\n"
 
@@ -1752,7 +2027,7 @@ func (m model) View() string {
 		content += "  " + dimmed + "Memory" + reset + "  " + memBar + " " + memColor + fmt.Sprintf("%5.1f%%", utilMem) + reset + "\n"
 
 		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Scroll\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + dimmed + "(more content below)" + reset + "\n"
 
 	case "services":
 		// Header
@@ -1761,28 +2036,50 @@ func (m model) View() string {
 		// Summary bar
 		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(m.services)) + reset + " services registered\n\n"
 
-		// Column widths
-		colName := 24
-		colTags := 24
-		colAddress := 18
-		colPort := 8
-		colJob := 18
-		colNode := 10
+		// Calculate dynamic column widths based on terminal width
+		// Services table has 6 columns: Name, Tags, Address, Port, Job, Node
+		// Weights: Name(3), Tags(3), Address(2), Port(1), Job(2), Node(1) = 12 total parts
+		tableWidth := getTableWidth(m.width, 6)
+		svcColWidths := calculateColumnWidths(tableWidth, []int{3, 3, 2, 1, 2, 1}, []int{12, 12, 12, 6, 12, 8})
+		colName := svcColWidths[0]
+		colTags := svcColWidths[1]
+		colAddress := svcColWidths[2]
+		colPort := svcColWidths[3]
+		colJob := svcColWidths[4]
+		colNode := svcColWidths[5]
 
 		// Table header with rounded corners
 		content += "  " + dimmed + "╭" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colTags) + "┬" + strings.Repeat("─", colAddress) + "┬" + strings.Repeat("─", colPort) + "┬" + strings.Repeat("─", colJob) + "┬" + strings.Repeat("─", colNode) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Service Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTags-1, "Tags") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAddress-1, "Address") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPort-1, "Port") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colJob-1, "Job") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colNode-1, "Node") + reset + dimmed + "│" + reset + "\n"
 		content += "  " + dimmed + "├" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colTags) + "┼" + strings.Repeat("─", colAddress) + "┼" + strings.Repeat("─", colPort) + "┼" + strings.Repeat("─", colJob) + "┼" + strings.Repeat("─", colNode) + "┤" + reset + "\n"
 
-		maxServices := len(m.services)
+		// Calculate how many services can be displayed
+		// Chrome lines breakdown: same as jobs = 15 lines
+		chromeLines := 15
+		maxVisibleServices := len(m.services)
 		if m.height > 0 {
-			maxServices = m.height - 12
-			if maxServices < 0 {
-				maxServices = 0
+			maxVisibleServices = m.height - chromeLines
+			if maxVisibleServices < 1 {
+				maxVisibleServices = 1
 			}
-			if maxServices > len(m.services) {
-				maxServices = len(m.services)
-			}
+		}
+
+		// Clamp scroll offset
+		maxScroll := len(m.services) - maxVisibleServices
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.servicesScrollOffset > maxScroll {
+			m.servicesScrollOffset = maxScroll
+		}
+		if m.servicesScrollOffset < 0 {
+			m.servicesScrollOffset = 0
+		}
+
+		// Calculate end index for visible services
+		endIndex := m.servicesScrollOffset + maxVisibleServices
+		if endIndex > len(m.services) {
+			endIndex = len(m.services)
 		}
 
 		if len(m.services) == 0 {
@@ -1791,7 +2088,7 @@ func (m model) View() string {
 			emptyPadding := (colName + colTags + colAddress + colPort + colJob + colNode + 5 - len(emptyMsg)) / 2
 			content += "  " + dimmed + "│" + reset + strings.Repeat(" ", emptyPadding) + dimmed + emptyMsg + reset + strings.Repeat(" ", colName+colTags+colAddress+colPort+colJob+colNode+5-emptyPadding-len(emptyMsg)) + dimmed + "│" + reset + "\n"
 		} else {
-			for i := 0; i < maxServices; i++ {
+			for i := m.servicesScrollOffset; i < endIndex; i++ {
 				svc := m.services[i]
 
 				// Service name with selection highlight
@@ -1832,8 +2129,14 @@ func (m model) View() string {
 
 		content += "  " + dimmed + "╰" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colTags) + "┴" + strings.Repeat("─", colAddress) + "┴" + strings.Repeat("─", colPort) + "┴" + strings.Repeat("─", colJob) + "┴" + strings.Repeat("─", colNode) + "╯" + reset + "\n"
 
+		// Scroll indicator (if list is scrollable)
+		scrollIndicator := ""
+		if len(m.services) > maxVisibleServices {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.servicesScrollOffset+1, endIndex, len(m.services), reset)
+		}
+
 		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "j" + reset + " Jobs  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + " Nodes  " + dimmed + "│" + reset + "  " + cyan + "c" + reset + " Cluster\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + scrollIndicator + "\n"
 
 	case "node-status":
 		if m.selectedNodeIndex >= 0 && m.selectedNodeIndex < len(m.nodes) {
@@ -1850,9 +2153,18 @@ func (m model) View() string {
 			content += "  " + bold + selectedNode.Name + reset + "  " + ansiColor(selectedNode.Status, m.theme) + statusIcon + " " + selectedNode.Status + reset + "\n"
 			content += "  " + dimmed + selectedNode.ID + reset + "\n\n"
 
+			// Dynamic separator width based on terminal
+			separatorWidth := m.width - 6
+			if separatorWidth < 30 {
+				separatorWidth = 30
+			}
+			if separatorWidth > 80 {
+				separatorWidth = 80
+			}
+
 			// Basic Info Section
 			content += "  " + bold + cyan + "BASIC INFORMATION" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", 50) + reset + "\n"
+			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
 			content += "  " + dimmed + "Datacenter:" + reset + "   " + selectedNode.datacenter + "\n"
 			content += "  " + dimmed + "Node Pool:" + reset + "    " + selectedNode.nodePool + "\n"
 
@@ -1872,7 +2184,7 @@ func (m model) View() string {
 
 			// Resources Section
 			content += "  " + bold + cyan + "RESOURCES" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", 50) + reset + "\n"
+			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
 
 			if selectedNode.fullNode != nil {
 				totalCPU := 0
@@ -1909,7 +2221,14 @@ func (m model) View() string {
 					} else if cpuUtil > 50 {
 						cpuColor = m.theme.UtilMedium
 					}
-					barWidth := 30
+					// Dynamic bar width based on terminal width
+					barWidth := m.width - 30 // Leave room for label and stats
+					if barWidth < 15 {
+						barWidth = 15
+					}
+					if barWidth > 40 {
+						barWidth = 40
+					}
 					filledWidth := int(cpuUtil / 100 * float64(barWidth))
 					cpuBar := cpuColor + strings.Repeat("█", filledWidth) + reset + dimmed + strings.Repeat("░", barWidth-filledWidth) + reset
 					content += "  " + dimmed + "CPU:" + reset + "  " + cpuBar + fmt.Sprintf(" %d / %d MHz", allocatedCPU, totalCPU) + "\n"
@@ -1923,7 +2242,14 @@ func (m model) View() string {
 					} else if memUtil > 50 {
 						memColor = m.theme.UtilMedium
 					}
-					barWidth := 30
+					// Dynamic bar width based on terminal width
+					barWidth := m.width - 30 // Leave room for label and stats
+					if barWidth < 15 {
+						barWidth = 15
+					}
+					if barWidth > 40 {
+						barWidth = 40
+					}
 					filledWidth := int(memUtil / 100 * float64(barWidth))
 					memBar := memColor + strings.Repeat("█", filledWidth) + reset + dimmed + strings.Repeat("░", barWidth-filledWidth) + reset
 					content += "  " + dimmed + "Mem:" + reset + "  " + memBar + fmt.Sprintf(" %d / %d MB", allocatedMemMB, totalMemMB) + "\n"
@@ -1936,7 +2262,7 @@ func (m model) View() string {
 
 			// Drivers & Volumes Section
 			content += "  " + bold + cyan + "CAPABILITIES" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", 50) + reset + "\n"
+			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
 			content += "  " + dimmed + "Drivers:" + reset + "      "
 			if len(selectedNode.drivers) > 0 {
 				content += strings.Join(selectedNode.drivers, ", ")
@@ -1956,7 +2282,7 @@ func (m model) View() string {
 			content += "  " + dimmed + "Allocations:" + reset + "  " + bold + fmt.Sprintf("%d", selectedNode.allocationCount) + reset + "\n"
 
 			// Navigation hint
-			content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev Node  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+			content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
 		} else {
 			content = "\n  No node selected. Press 'Esc' to go back.\n"
 		}
@@ -2075,12 +2401,15 @@ func (m model) View() string {
 			content += dimmed + ")" + reset + "\n"
 
 			if len(selectedJob.allocs) > 0 {
-				// Clean allocation table with rounded corners
-				colID := 14
-				colTaskGroup := 18
-				colStatus := 12
-				colEvent := 14
-				colNode := 22
+				// Calculate dynamic column widths for allocations table
+				// 5 columns: ID, TaskGroup, Status, Event, Node
+				allocTableWidth := getTableWidth(m.width, 5)
+				allocColWidths := calculateColumnWidths(allocTableWidth, []int{2, 3, 2, 2, 3}, []int{10, 12, 10, 10, 12})
+				colID := allocColWidths[0]
+				colTaskGroup := allocColWidths[1]
+				colStatus := allocColWidths[2]
+				colEvent := allocColWidths[3]
+				colNode := allocColWidths[4]
 
 				content += "  " + dimmed + "╭" + strings.Repeat("─", colID) + "┬" + strings.Repeat("─", colTaskGroup) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colEvent) + "┬" + strings.Repeat("─", colNode) + "╮" + reset + "\n"
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colID-1, "Alloc ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTaskGroup-1, "Task Group") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvent-1, "Last Event") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colNode-1, "Node") + reset + dimmed + "│" + reset + "\n"
@@ -2157,12 +2486,15 @@ func (m model) View() string {
 			content += "\n  " + bold + cyan + "EVALUATIONS" + reset + "\n"
 
 			if len(selectedJob.evaluations) > 0 {
-				// Evaluations table
-				colEvalID := 14
-				colEvalStatus := 12
-				colTriggeredBy := 16
-				colPlacement := 20
-				colTime := 18
+				// Calculate dynamic column widths for evaluations table
+				// 5 columns: EvalID, Status, TriggeredBy, Placement, Time
+				evalTableWidth := getTableWidth(m.width, 5)
+				evalColWidths := calculateColumnWidths(evalTableWidth, []int{2, 2, 2, 3, 2}, []int{10, 10, 12, 14, 14})
+				colEvalID := evalColWidths[0]
+				colEvalStatus := evalColWidths[1]
+				colTriggeredBy := evalColWidths[2]
+				colPlacement := evalColWidths[3]
+				colTime := evalColWidths[4]
 
 				content += "  " + dimmed + "╭" + strings.Repeat("─", colEvalID) + "┬" + strings.Repeat("─", colEvalStatus) + "┬" + strings.Repeat("─", colTriggeredBy) + "┬" + strings.Repeat("─", colPlacement) + "┬" + strings.Repeat("─", colTime) + "╮" + reset + "\n"
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalID-1, "Eval ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTriggeredBy-1, "Triggered By") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPlacement-1, "Placement") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + "\n"
@@ -2294,9 +2626,9 @@ func (m model) View() string {
 
 			// Clean navigation bar - dynamic based on allocation selection mode
 			if m.allocSelectMode {
-				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
+				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
 			} else {
-				content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "a" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev Job  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "e" + reset + " Events  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+				content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "a" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "e" + reset + " Events  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
 			}
 		} else {
 			content = "\n  Invalid job selection. Press 'Esc' to go back.\n"
@@ -2365,12 +2697,15 @@ func (m model) View() string {
 		if len(m.eventsList) == 0 {
 			content += "  " + dimmed + "Loading events..." + reset + "\n"
 		} else {
-			// Table header with rounded corners
-			colTime := 20
-			colAlloc := 10
-			colTask := 15
-			colType := 15
-			colMsg := 30
+			// Calculate dynamic column widths for events table
+			// 5 columns: Time, Alloc, Task, Type, Message
+			eventsTableWidth := getTableWidth(m.width, 5)
+			eventsColWidths := calculateColumnWidths(eventsTableWidth, []int{3, 1, 2, 2, 4}, []int{16, 8, 10, 10, 16})
+			colTime := eventsColWidths[0]
+			colAlloc := eventsColWidths[1]
+			colTask := eventsColWidths[2]
+			colType := eventsColWidths[3]
+			colMsg := eventsColWidths[4]
 
 			content += "  " + dimmed + "╭" + strings.Repeat("─", colTime) + "┬" + strings.Repeat("─", colAlloc) + "┬" + strings.Repeat("─", colTask) + "┬" + strings.Repeat("─", colType) + "┬" + strings.Repeat("─", colMsg) + "╮" + reset + "\n"
 			content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAlloc-1, "Alloc") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTask-1, "Task") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colMsg-1, "Message") + reset + dimmed + "│" + reset + "\n"
@@ -2433,11 +2768,13 @@ func (m model) View() string {
 	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
 
 	// Apply scrolling for scrollable views (job-status, node-status, cluster)
+	// Reserve 4 lines for footers: 1 blank + 1 nav hint + 1 separator + 1 app footer bar
+	footerReserve := 4
 	scrollableViews := m.view == "job-status" || m.view == "node-status" || m.view == "cluster"
 	if scrollableViews && len(lines) > m.height {
 		// Calculate visible area (excluding footer lines)
-		visibleLines := m.height - 3
-		totalScrollable := len(lines) - 3 // exclude footer
+		visibleLines := m.height - footerReserve
+		totalScrollable := len(lines) - footerReserve // exclude footers
 
 		// Clamp scroll offset
 		maxScroll := totalScrollable - visibleLines
@@ -2452,17 +2789,18 @@ func (m model) View() string {
 			scrollOffset = 0
 		}
 
-		// Get scrolled content + footer
+		// Get scrolled content + footers
 		endLine := scrollOffset + visibleLines
 		if endLine > totalScrollable {
 			endLine = totalScrollable
 		}
 		scrolledLines := lines[scrollOffset:endLine]
-		// Add footer lines back
-		scrolledLines = append(scrolledLines, lines[len(lines)-3:]...)
+		// Add footer lines back (page footer + app footer)
+		scrolledLines = append(scrolledLines, lines[len(lines)-footerReserve:]...)
 		lines = scrolledLines
 	} else if len(lines) > m.height {
-		lines = append(lines[:m.height-3], lines[len(lines)-3:]...)
+		// For non-scrollable views, truncate content but keep footers visible
+		lines = append(lines[:m.height-footerReserve], lines[len(lines)-footerReserve:]...)
 	}
 	mainContent := strings.Join(lines, "\n") + "\n"
 	if m.confirmAction != "" {
