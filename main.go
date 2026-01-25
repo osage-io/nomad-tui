@@ -97,6 +97,7 @@ type model struct {
 	jobsScrollOffset     int             // scroll offset for jobs list view
 	nodesScrollOffset    int             // scroll offset for nodes list view
 	servicesScrollOffset int             // scroll offset for services list view
+	logsScrollOffset     int             // scroll offset for logs view
 	allocSelectMode      bool            // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
 	evalSelectMode       bool            // when true, ↑/↓ navigates evaluations instead of scrolling in job-status view
 	selectedEvalIndex    int             // index of selected evaluation in job-status view
@@ -1371,6 +1372,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == "cluster" && m.scrollOffset > 0 {
 				m.scrollOffset--
 			}
+			if m.view == "job-logs" && m.logsScrollOffset > 0 {
+				m.logsScrollOffset--
+			}
 		case "down":
 			if m.view == "jobs" {
 				maxJobs := len(m.filteredJobs)
@@ -1466,6 +1470,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == "cluster" {
 				m.scrollOffset++
 			}
+			if m.view == "job-logs" {
+				m.logsScrollOffset++
+			}
 		case "s":
 			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
 				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
@@ -1547,6 +1554,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logJobName = selectedJob.Name
 				m.previousView = m.view
 				m.view = "job-logs"
+				m.logsScrollOffset = 0 // Reset scroll when opening logs
 				// Use the selected allocation if one is selected and valid
 				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
 					selectedAlloc := selectedJob.allocs[m.selectedAllocIndex]
@@ -1561,6 +1569,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logJobName = m.selectedAlloc.JobID
 				m.previousView = m.view
 				m.view = "job-logs"
+				m.logsScrollOffset = 0 // Reset scroll when opening logs
 				// Convert Allocation to AllocationListStub for fetchAllocLogs
 				allocStub := &api.AllocationListStub{
 					ID:           m.selectedAlloc.ID,
@@ -1640,6 +1649,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.filteredJobs = m.buildFilteredJobs()
 				m.filteredNodes = m.buildFilteredNodes()
 				m.filteredServices = m.buildFilteredServices()
+			}
+		case "home":
+			// Jump to top of logs
+			if m.view == "job-logs" {
+				m.logsScrollOffset = 0
+			}
+		case "end":
+			// Jump to bottom of logs
+			if m.view == "job-logs" {
+				// Set to max scroll (will be clamped in View)
+				m.logsScrollOffset = 999999
+			}
+		case "pgup":
+			// Page up in logs
+			if m.view == "job-logs" {
+				pageSize := m.height - 12
+				if pageSize < 5 {
+					pageSize = 5
+				}
+				m.logsScrollOffset -= pageSize
+				if m.logsScrollOffset < 0 {
+					m.logsScrollOffset = 0
+				}
+			}
+		case "pgdn":
+			// Page down in logs
+			if m.view == "job-logs" {
+				pageSize := m.height - 12
+				if pageSize < 5 {
+					pageSize = 5
+				}
+				m.logsScrollOffset += pageSize
 			}
 		}
 	case dataMsg:
@@ -1739,6 +1780,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logContent = msg.content
 			m.logAllocID = msg.allocID
 			m.logTaskName = msg.taskName
+			// Auto-scroll to bottom when new logs are loaded
+			m.logsScrollOffset = 999999 // Will be clamped to max in View
 		}
 		return m, nil
 	case eventsMsg:
@@ -3400,14 +3443,30 @@ func (m model) View() string {
 			maxLogLines = 5
 		}
 
-		// Split log content into lines and show the last N lines
+		// Split log content into lines
 		logLines := strings.Split(m.logContent, "\n")
-		startLine := 0
-		if len(logLines) > maxLogLines {
-			startLine = len(logLines) - maxLogLines
+		totalLines := len(logLines)
+
+		// Clamp scroll offset
+		maxScroll := totalLines - maxLogLines
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		if m.logsScrollOffset > maxScroll {
+			m.logsScrollOffset = maxScroll
+		}
+		if m.logsScrollOffset < 0 {
+			m.logsScrollOffset = 0
 		}
 
-		for i := startLine; i < len(logLines); i++ {
+		// Calculate visible range
+		startLine := m.logsScrollOffset
+		endLine := startLine + maxLogLines
+		if endLine > totalLines {
+			endLine = totalLines
+		}
+
+		for i := startLine; i < endLine; i++ {
 			line := logLines[i]
 			// Highlight STDOUT/STDERR headers
 			if strings.HasPrefix(line, "=== STDOUT ===") {
@@ -3423,8 +3482,14 @@ func (m model) View() string {
 			}
 		}
 
+		// Scroll indicator
+		scrollIndicator := ""
+		if totalLines > maxLogLines {
+			scrollIndicator = fmt.Sprintf("  %s(lines %d-%d of %d)%s", dimmed, startLine+1, endLine, totalLines, reset)
+		}
+
 		// Navigation hint
-		content += "\n  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "Home" + reset + " Top  " + dimmed + "│" + reset + "  " + cyan + "End" + reset + " Bottom  " + dimmed + "│" + reset + "  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back" + scrollIndicator + "\n"
 
 	case "job-events":
 		// Header
