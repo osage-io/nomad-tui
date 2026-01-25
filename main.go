@@ -98,6 +98,11 @@ type model struct {
 	nodesScrollOffset    int  // scroll offset for nodes list view
 	servicesScrollOffset int  // scroll offset for services list view
 	allocSelectMode      bool // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
+	// Blocking query state
+	jobsIndex     uint64 // LastIndex for jobs blocking query
+	nodesIndex    uint64 // LastIndex for nodes blocking query
+	servicesIndex uint64 // LastIndex for services blocking query
+	blockingActive bool  // true when a blocking query goroutine is running
 }
 
 type jobEvent struct {
@@ -133,6 +138,10 @@ type dataMsg struct {
 	totalUsedCPU     float64
 	totalReservedMem int
 	totalUsedMem     float64
+	// Blocking query indices
+	jobsIndex     uint64
+	nodesIndex    uint64
+	servicesIndex uint64
 }
 
 type logsMsg struct {
@@ -150,11 +159,11 @@ type eventsMsg struct {
 }
 
 func fetchData(client *api.Client) tea.Msg {
-	jobs, _, err := client.Jobs().List(nil)
+	jobs, jobsMeta, err := client.Jobs().List(nil)
 	if err != nil {
 		return errMsg(err)
 	}
-	nodes, _, err := client.Nodes().List(nil)
+	nodes, nodesMeta, err := client.Nodes().List(nil)
 	if err != nil {
 		return errMsg(err)
 	}
@@ -422,8 +431,12 @@ func fetchData(client *api.Client) tea.Msg {
 
 	// Fetch Nomad native services
 	servicesList := make([]*serviceInfo, 0)
-	serviceStubs, _, err := client.Services().List(nil)
+	var servicesIndex uint64
+	serviceStubs, servicesMeta, err := client.Services().List(nil)
 	if err == nil {
+		if servicesMeta != nil {
+			servicesIndex = servicesMeta.LastIndex
+		}
 		for _, stub := range serviceStubs {
 			if stub.Services != nil {
 				for _, svcStub := range stub.Services {
@@ -455,7 +468,7 @@ func fetchData(client *api.Client) tea.Msg {
 		return servicesList[i].Name < servicesList[j].Name
 	})
 
-	return dataMsg{jobs: jobStatsList, nodes: nodeStatsList, services: servicesList, totalAvailCPU: totalAvailCPU, totalAvailMem: totalAvailMem, totalCapacityCPU: totalCapacityCPU, totalCapacityMem: totalCapacityMem, totalReservedCPU: totalReservedCPU, totalUsedCPU: totalUsedCPU, totalReservedMem: totalReservedMem, totalUsedMem: totalUsedMem}
+	return dataMsg{jobs: jobStatsList, nodes: nodeStatsList, services: servicesList, totalAvailCPU: totalAvailCPU, totalAvailMem: totalAvailMem, totalCapacityCPU: totalCapacityCPU, totalCapacityMem: totalCapacityMem, totalReservedCPU: totalReservedCPU, totalUsedCPU: totalUsedCPU, totalReservedMem: totalReservedMem, totalUsedMem: totalUsedMem, jobsIndex: jobsMeta.LastIndex, nodesIndex: nodesMeta.LastIndex, servicesIndex: servicesIndex}
 }
 
 func stopJob(client *api.Client, jobID string) tea.Msg {
@@ -464,6 +477,70 @@ func stopJob(client *api.Client, jobID string) tea.Msg {
 		return errMsg(err)
 	}
 	return refreshMsg{}
+}
+
+// blockingQueryMsg is sent when a blocking query detects a change or times out
+type blockingQueryMsg struct {
+	changed bool
+	err     error
+}
+
+// startBlockingQuery starts a blocking query that monitors for changes to jobs, nodes, or services.
+// It uses the Nomad blocking query mechanism: if WaitIndex is set, the API will block until
+// data changes (new LastIndex > WaitIndex) or timeout (default 5 minutes).
+// Returns a tea.Cmd that spawns a goroutine to perform the blocking query.
+func startBlockingQuery(client *api.Client, jobsIndex, nodesIndex, servicesIndex uint64) tea.Cmd {
+	return func() tea.Msg {
+		// We use a short wait time to be responsive, but still benefit from blocking
+		// Default Nomad wait is 5 minutes, but we use 30 seconds for better UX
+		waitTime := 30 * time.Second
+
+		// Try blocking on jobs first (most common changes)
+		jobsOpts := &api.QueryOptions{
+			WaitIndex: jobsIndex,
+			WaitTime:  waitTime,
+		}
+		_, jobsMeta, err := client.Jobs().List(jobsOpts)
+		if err != nil {
+			// On error, signal to retry with a fresh fetch
+			return blockingQueryMsg{changed: false, err: err}
+		}
+
+		// If jobs changed, trigger a full refresh
+		if jobsMeta.LastIndex > jobsIndex {
+			return blockingQueryMsg{changed: true, err: nil}
+		}
+
+		// Check nodes (blocking query already returned, so just check current state)
+		nodesOpts := &api.QueryOptions{
+			WaitIndex: nodesIndex,
+			WaitTime:  1 * time.Second, // Short wait since we already blocked on jobs
+		}
+		_, nodesMeta, err := client.Nodes().List(nodesOpts)
+		if err != nil {
+			return blockingQueryMsg{changed: false, err: err}
+		}
+		if nodesMeta.LastIndex > nodesIndex {
+			return blockingQueryMsg{changed: true, err: nil}
+		}
+
+		// Check services
+		servicesOpts := &api.QueryOptions{
+			WaitIndex: servicesIndex,
+			WaitTime:  1 * time.Second,
+		}
+		_, servicesMeta, err := client.Services().List(servicesOpts)
+		if err != nil {
+			// Services might not be available, don't treat as fatal
+			return blockingQueryMsg{changed: false, err: nil}
+		}
+		if servicesMeta != nil && servicesMeta.LastIndex > servicesIndex {
+			return blockingQueryMsg{changed: true, err: nil}
+		}
+
+		// No changes detected during the blocking period
+		return blockingQueryMsg{changed: false, err: nil}
+	}
 }
 
 func deleteJob(client *api.Client, jobID string) tea.Msg {
@@ -905,9 +982,13 @@ type errMsg error
 type refreshMsg struct{}
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tea.ClearScreen, tea.Cmd(func() tea.Msg { return fetchData(m.client) }), tea.Tick(5*time.Second, func(t time.Time) tea.Msg {
-		return tickMsg{}
-	}))
+	// Initial load: fetch data immediately, then start with a heartbeat tick
+	// Blocking queries will be started after first data load
+	return tea.Batch(
+		tea.ClearScreen,
+		tea.Cmd(func() tea.Msg { return fetchData(m.client) }),
+		tea.Tick(30*time.Second, func(t time.Time) tea.Msg { return tickMsg{} }),
+	)
 }
 
 type tickMsg time.Time
@@ -1285,6 +1366,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalUsedCPU = msg.totalUsedCPU
 		m.totalReservedMem = msg.totalReservedMem
 		m.totalUsedMem = msg.totalUsedMem
+		// Store blocking query indices
+		m.jobsIndex = msg.jobsIndex
+		m.nodesIndex = msg.nodesIndex
+		m.servicesIndex = msg.servicesIndex
 		if m.selectedIndex >= len(m.jobs) {
 			m.selectedIndex = 0
 		}
@@ -1299,10 +1384,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmAction = ""
 		m.confirmJob = nil
 		m.err = nil
-		return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return tickMsg{} })
+		// Start blocking query to wait for changes
+		m.blockingActive = true
+		return m, startBlockingQuery(m.client, m.jobsIndex, m.nodesIndex, m.servicesIndex)
+	case blockingQueryMsg:
+		m.blockingActive = false
+		if msg.err != nil {
+			// On error, schedule a retry after a short delay
+			return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return tickMsg{} })
+		}
+		if msg.changed {
+			// Data changed, fetch fresh data
+			return m, tea.Cmd(func() tea.Msg { return fetchData(m.client) })
+		}
+		// No change detected, start another blocking query
+		m.blockingActive = true
+		return m, startBlockingQuery(m.client, m.jobsIndex, m.nodesIndex, m.servicesIndex)
+	case tickMsg:
+		// Heartbeat tick - if blocking query isn't active, start a fresh fetch
+		if !m.blockingActive {
+			return m, tea.Cmd(func() tea.Msg { return fetchData(m.client) })
+		}
+		// Blocking query is active, just reschedule the heartbeat
+		return m, tea.Tick(30*time.Second, func(t time.Time) tea.Msg { return tickMsg{} })
 	case errMsg:
 		m.err = error(msg)
-		return m, nil
+		m.blockingActive = false
+		// On error, retry after a delay
+		return m, tea.Tick(5*time.Second, func(t time.Time) tea.Msg { return tickMsg{} })
 	case refreshMsg:
 		return m, tea.Cmd(func() tea.Msg { return fetchData(m.client) })
 	case logsMsg:
