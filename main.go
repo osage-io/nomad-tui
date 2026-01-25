@@ -103,6 +103,9 @@ type model struct {
 	selectedAlloc        *api.Allocation // currently selected allocation for alloc-detail view
 	selectedEval         *api.Evaluation // currently selected evaluation for eval-detail view
 	previousView         string          // track previous view for back navigation
+	// Filter/search state
+	filterActive bool   // when true, show filter input overlay
+	filterInput  string // current filter text input
 	// Blocking query state
 	jobsIndex      uint64 // LastIndex for jobs blocking query
 	nodesIndex     uint64 // LastIndex for nodes blocking query
@@ -1133,18 +1136,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "down":
 				m.helpScrollOffset++
 				return m, nil
-			case "j":
-				m.showHelp = false
-				m.helpScrollOffset = 0
-				m.view = "jobs"
-			case "n":
-				m.showHelp = false
-				m.helpScrollOffset = 0
-				m.view = "nodes"
-			case "r":
-				return m, tea.Cmd(func() tea.Msg { return fetchData(m.client) })
 			}
 			return m, nil
+		}
+		// Handle filter input
+		if m.filterActive {
+			switch key {
+			case "esc":
+				m.filterActive = false
+				m.filterInput = ""
+				return m, nil
+			case "enter":
+				m.filterActive = false
+				return m, nil
+			case "backspace":
+				if len(m.filterInput) > 0 {
+					m.filterInput = m.filterInput[:len(m.filterInput)-1]
+				}
+				return m, nil
+			default:
+				// Add printable characters to filter input
+				if len(key) == 1 && key >= " " && key <= "~" {
+					m.filterInput += key
+				}
+				return m, nil
+			}
 		}
 		switch key {
 		case "q", "ctrl+c":
@@ -1540,6 +1556,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "h":
 			m.showHelp = true
 			return m, tea.ClearScreen
+		case "/", "f":
+			// Activate filter mode in applicable views
+			if m.view == "jobs" || m.view == "nodes" || m.view == "services" || m.view == "job-status" {
+				m.filterActive = true
+				m.filterInput = ""
+			}
 		}
 	case dataMsg:
 		m.jobs = msg.jobs
@@ -1643,6 +1665,90 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
+}
+
+// matchesFilter returns true if the text contains the filter string (case-insensitive)
+func matchesFilter(text string, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(text), strings.ToLower(filter))
+}
+
+// highlightMatch highlights the filter match in the text with color
+func highlightMatch(text string, filter string, highlightColor string, reset string) string {
+	if filter == "" {
+		return text
+	}
+	lowerText := strings.ToLower(text)
+	lowerFilter := strings.ToLower(filter)
+	index := strings.Index(lowerText, lowerFilter)
+	if index == -1 {
+		return text
+	}
+	// Highlight the matching portion
+	before := text[:index]
+	match := text[index : index+len(filter)]
+	after := text[index+len(filter):]
+	return before + highlightColor + match + reset + after
+}
+
+// renderFilterOverlay renders a centered search/filter input box
+func renderFilterOverlay(width int, height int, filterInput string, theme Theme) string {
+	boxWidth := 60
+	if boxWidth > width-4 {
+		boxWidth = width - 4
+	}
+
+	// Calculate position (centered)
+	startRow := (height - 5) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	leftPad := (width - boxWidth) / 2
+	if leftPad < 0 {
+		leftPad = 0
+	}
+
+	padding := safeRepeat(" ", leftPad)
+	cyan := "\033[36m"
+	reset := "\033[0m"
+
+	// Build the overlay
+	var lines []string
+
+	// Add blank lines before box
+	for i := 0; i < startRow; i++ {
+		lines = append(lines, "")
+	}
+
+	// Top border
+	lines = append(lines, padding+"╭"+safeRepeat("─", boxWidth-2)+"╮")
+
+	// Title line
+	title := " Filter (Esc to cancel, Enter to apply) "
+	titlePad := (boxWidth - 2 - len(title)) / 2
+	if titlePad < 0 {
+		titlePad = 0
+	}
+	lines = append(lines, padding+"│"+safeRepeat(" ", titlePad)+cyan+title+reset+safeRepeat(" ", boxWidth-2-titlePad-len(title))+"│")
+
+	// Separator
+	lines = append(lines, padding+"├"+safeRepeat("─", boxWidth-2)+"┤")
+
+	// Input line with cursor
+	inputDisplay := filterInput + "█" // cursor
+	inputPadding := boxWidth - 4 - len(inputDisplay)
+	if inputPadding < 0 {
+		inputPadding = 0
+		inputDisplay = inputDisplay[:boxWidth-4]
+	}
+	lines = append(lines, padding+"│ "+inputDisplay+safeRepeat(" ", inputPadding)+" │")
+
+	// Bottom border
+	lines = append(lines, padding+"╰"+safeRepeat("─", boxWidth-2)+"╯")
+
+	return strings.Join(lines, "\n")
 }
 
 func (m model) View() string {
@@ -1944,7 +2050,19 @@ func (m model) View() string {
 		runningCount := 0
 		pendingCount := 0
 		deadCount := 0
-		for _, job := range m.jobs {
+
+		// Filter jobs if filter is active
+		filteredJobs := m.jobs
+		if m.filterInput != "" {
+			filteredJobs = make([]*jobStats, 0)
+			for _, job := range m.jobs {
+				if matchesFilter(job.Name, m.filterInput) {
+					filteredJobs = append(filteredJobs, job)
+				}
+			}
+		}
+
+		for _, job := range filteredJobs {
 			switch job.Status {
 			case "running":
 				runningCount++
@@ -1954,7 +2072,10 @@ func (m model) View() string {
 				deadCount++
 			}
 		}
-		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(m.jobs)) + reset
+		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(filteredJobs)) + reset
+		if m.filterInput != "" {
+			content += " " + dimmed + "(filtered from " + fmt.Sprintf("%d", len(m.jobs)) + ")" + reset
+		}
 		content += "  │  " + m.theme.Running + "●" + reset + " Running: " + bold + fmt.Sprintf("%d", runningCount) + reset
 		content += "  │  " + m.theme.Pending + "●" + reset + " Pending: " + bold + fmt.Sprintf("%d", pendingCount) + reset
 		content += "  │  " + m.theme.Dead + "●" + reset + " Dead: " + bold + fmt.Sprintf("%d", deadCount) + reset + "\n\n"
@@ -1981,7 +2102,7 @@ func (m model) View() string {
 		// After table: 1 (table bottom) + 2 (nav hint) + 1 (separator) + 1 (footer) = 5
 		// Total chrome = 15 lines
 		chromeLines := 15
-		maxVisibleJobs := len(m.jobs)
+		maxVisibleJobs := len(filteredJobs)
 		if m.height > 0 {
 			maxVisibleJobs = m.height - chromeLines
 			if maxVisibleJobs < 1 {
@@ -1990,7 +2111,7 @@ func (m model) View() string {
 		}
 
 		// Clamp scroll offset
-		maxScroll := len(m.jobs) - maxVisibleJobs
+		maxScroll := len(filteredJobs) - maxVisibleJobs
 		if maxScroll < 0 {
 			maxScroll = 0
 		}
@@ -2003,20 +2124,24 @@ func (m model) View() string {
 
 		// Calculate end index for visible jobs
 		endIndex := m.jobsScrollOffset + maxVisibleJobs
-		if endIndex > len(m.jobs) {
-			endIndex = len(m.jobs)
+		if endIndex > len(filteredJobs) {
+			endIndex = len(filteredJobs)
 		}
 
 		for i := m.jobsScrollOffset; i < endIndex; i++ {
-			job := m.jobs[i]
+			job := filteredJobs[i]
 
-			// Job name with selection highlight
+			// Job name with selection highlight and filter highlighting
 			name := truncate(job.Name, colName-2)
 			var nameField string
 			if i == m.selectedIndex {
 				nameField = bold + m.theme.HighlightBg + "\033[30m" + fmt.Sprintf(" %-*s", colName-1, name) + reset
 			} else {
-				nameField = " " + white + fmt.Sprintf("%-*s", colName-1, name) + reset
+				// Apply filter highlighting if filter is active
+				if m.filterInput != "" {
+					name = highlightMatch(name, m.filterInput, m.theme.Running, reset)
+				}
+				nameField = " " + white + name + safeRepeat(" ", colName-1-len(truncate(job.Name, colName-2))) + reset
 			}
 
 			// Status with color and icon
@@ -2053,28 +2178,48 @@ func (m model) View() string {
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
-		if len(m.jobs) > maxVisibleJobs {
-			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.jobsScrollOffset+1, endIndex, len(m.jobs), reset)
+		if len(filteredJobs) > maxVisibleJobs {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.jobsScrollOffset+1, endIndex, len(filteredJobs), reset)
 		}
 
-		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete  " + scrollIndicator + "\n"
+		// Navigation hint with filter indicator
+		filterHint := ""
+		if m.filterInput != "" {
+			filterHint = "  " + dimmed + "│" + reset + "  " + m.theme.Running + "/" + reset + " Filter: " + bold + m.filterInput + reset
+		} else {
+			filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
+		}
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete" + filterHint + "  " + scrollIndicator + "\n"
 
 	case "nodes":
 		// Header
 		content = "\n" + renderHeader("🖥️  NOMAD NODES", boxWidth, m.theme.Header, bold, reset) + "\n"
 
+		// Filter nodes if filter is active
+		filteredNodes := m.nodes
+		if m.filterInput != "" {
+			filteredNodes = make([]*nodeStats, 0)
+			for _, node := range m.nodes {
+				if matchesFilter(node.Name, m.filterInput) || matchesFilter(node.ID, m.filterInput) {
+					filteredNodes = append(filteredNodes, node)
+				}
+			}
+		}
+
 		// Summary bar
 		readyCount := 0
 		downCount := 0
-		for _, node := range m.nodes {
+		for _, node := range filteredNodes {
 			if node.Status == "ready" {
 				readyCount++
 			} else {
 				downCount++
 			}
 		}
-		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(m.nodes)) + reset
+		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(filteredNodes)) + reset
+		if m.filterInput != "" {
+			content += " " + dimmed + "(filtered from " + fmt.Sprintf("%d", len(m.nodes)) + ")" + reset
+		}
 		content += "  │  " + m.theme.Running + "●" + reset + " Ready: " + bold + fmt.Sprintf("%d", readyCount) + reset
 		content += "  │  " + m.theme.Dead + "●" + reset + " Down: " + bold + fmt.Sprintf("%d", downCount) + reset + "\n\n"
 
@@ -2099,7 +2244,7 @@ func (m model) View() string {
 		// Calculate how many nodes can be displayed
 		// Chrome lines breakdown: same as jobs = 15 lines
 		chromeLines := 15
-		maxVisibleNodes := len(m.nodes)
+		maxVisibleNodes := len(filteredNodes)
 		if m.height > 0 {
 			maxVisibleNodes = m.height - chromeLines
 			if maxVisibleNodes < 1 {
@@ -2108,7 +2253,7 @@ func (m model) View() string {
 		}
 
 		// Clamp scroll offset
-		maxScroll := len(m.nodes) - maxVisibleNodes
+		maxScroll := len(filteredNodes) - maxVisibleNodes
 		if maxScroll < 0 {
 			maxScroll = 0
 		}
@@ -2121,12 +2266,12 @@ func (m model) View() string {
 
 		// Calculate end index for visible nodes
 		endIndex := m.nodesScrollOffset + maxVisibleNodes
-		if endIndex > len(m.nodes) {
-			endIndex = len(m.nodes)
+		if endIndex > len(filteredNodes) {
+			endIndex = len(filteredNodes)
 		}
 
 		for i := m.nodesScrollOffset; i < endIndex; i++ {
-			node := m.nodes[i]
+			node := filteredNodes[i]
 
 			// ID (first part)
 			idParts := strings.Split(node.ID, "-")
@@ -2139,14 +2284,25 @@ func (m model) View() string {
 			if i == m.selectedNodeIndex {
 				idField = bold + m.theme.HighlightBg + "\033[30m" + fmt.Sprintf(" %-*s", colID-1, idText) + reset
 			} else {
-				idField = " " + fmt.Sprintf("%-*s", colID-1, idText)
+				// Apply filter highlighting if filter is active
+				if m.filterInput != "" {
+					idText = highlightMatch(idText, m.filterInput, m.theme.Running, reset)
+				}
+				idField = " " + idText + safeRepeat(" ", colID-1-len(truncate(node.ID, colID-2))) + reset
 			}
 
 			// DC
 			dcField := " " + fmt.Sprintf("%-*s", colDC-1, truncate(node.datacenter, colDC-2))
 
-			// Name
-			nameField := " " + fmt.Sprintf("%-*s", colName-1, truncate(node.Name, colName-2))
+			// Name with filter highlighting
+			nodeName := truncate(node.Name, colName-2)
+			nameField := ""
+			if m.filterInput != "" && i != m.selectedNodeIndex {
+				nodeName = highlightMatch(nodeName, m.filterInput, m.theme.Running, reset)
+				nameField = " " + nodeName + safeRepeat(" ", colName-1-len(truncate(node.Name, colName-2)))
+			} else {
+				nameField = " " + fmt.Sprintf("%-*s", colName-1, nodeName)
+			}
 
 			// OS with version and color
 			osFullText := node.osName
@@ -2183,12 +2339,18 @@ func (m model) View() string {
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
-		if len(m.nodes) > maxVisibleNodes {
-			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.nodesScrollOffset+1, endIndex, len(m.nodes), reset)
+		if len(filteredNodes) > maxVisibleNodes {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.nodesScrollOffset+1, endIndex, len(filteredNodes), reset)
 		}
 
-		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + scrollIndicator + "\n"
+		// Navigation hint with filter indicator
+		filterHint := ""
+		if m.filterInput != "" {
+			filterHint = "  " + dimmed + "│" + reset + "  " + m.theme.Running + "/" + reset + " Filter: " + bold + m.filterInput + reset
+		} else {
+			filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
+		}
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details" + filterHint + "  " + scrollIndicator + "\n"
 
 	case "cluster":
 		// Header
@@ -2353,8 +2515,23 @@ func (m model) View() string {
 		// Header
 		content = "\n" + renderHeader("🔗 NOMAD SERVICES", boxWidth, m.theme.Header, bold, reset) + "\n"
 
+		// Filter services if filter is active
+		filteredServices := m.services
+		if m.filterInput != "" {
+			filteredServices = make([]*serviceInfo, 0)
+			for _, svc := range m.services {
+				if matchesFilter(svc.Name, m.filterInput) {
+					filteredServices = append(filteredServices, svc)
+				}
+			}
+		}
+
 		// Summary bar
-		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(m.services)) + reset + " services registered\n\n"
+		content += "  " + dimmed + "Total:" + reset + " " + bold + fmt.Sprintf("%d", len(filteredServices)) + reset + " services registered"
+		if m.filterInput != "" {
+			content += " " + dimmed + "(filtered from " + fmt.Sprintf("%d", len(m.services)) + ")" + reset
+		}
+		content += "\n\n"
 
 		// Calculate dynamic column widths based on terminal width
 		// Services table has 6 columns: Name, Tags, Address, Port, Job, Node
@@ -2376,7 +2553,7 @@ func (m model) View() string {
 		// Calculate how many services can be displayed
 		// Chrome lines breakdown: same as jobs = 15 lines
 		chromeLines := 15
-		maxVisibleServices := len(m.services)
+		maxVisibleServices := len(filteredServices)
 		if m.height > 0 {
 			maxVisibleServices = m.height - chromeLines
 			if maxVisibleServices < 1 {
@@ -2385,7 +2562,7 @@ func (m model) View() string {
 		}
 
 		// Clamp scroll offset
-		maxScroll := len(m.services) - maxVisibleServices
+		maxScroll := len(filteredServices) - maxVisibleServices
 		if maxScroll < 0 {
 			maxScroll = 0
 		}
@@ -2398,26 +2575,33 @@ func (m model) View() string {
 
 		// Calculate end index for visible services
 		endIndex := m.servicesScrollOffset + maxVisibleServices
-		if endIndex > len(m.services) {
-			endIndex = len(m.services)
+		if endIndex > len(filteredServices) {
+			endIndex = len(filteredServices)
 		}
 
-		if len(m.services) == 0 {
+		if len(filteredServices) == 0 {
 			// Empty state
 			emptyMsg := "No services registered"
+			if m.filterInput != "" {
+				emptyMsg = "No services match filter"
+			}
 			emptyPadding := (colName + colTags + colAddress + colPort + colJob + colNode + 5 - len(emptyMsg)) / 2
 			content += "  " + dimmed + "│" + reset + safeRepeat(" ", emptyPadding) + dimmed + emptyMsg + reset + safeRepeat(" ", colName+colTags+colAddress+colPort+colJob+colNode+5-emptyPadding-len(emptyMsg)) + dimmed + "│" + reset + "\n"
 		} else {
 			for i := m.servicesScrollOffset; i < endIndex; i++ {
-				svc := m.services[i]
+				svc := filteredServices[i]
 
-				// Service name with selection highlight
+				// Service name with selection highlight and filter highlighting
 				name := truncate(svc.Name, colName-2)
 				var nameField string
 				if i == m.selectedServiceIndex {
 					nameField = bold + m.theme.HighlightBg + "\033[30m" + fmt.Sprintf(" %-*s", colName-1, name) + reset
 				} else {
-					nameField = " " + white + fmt.Sprintf("%-*s", colName-1, name) + reset
+					// Apply filter highlighting if filter is active
+					if m.filterInput != "" {
+						name = highlightMatch(name, m.filterInput, m.theme.Running, reset)
+					}
+					nameField = " " + white + name + safeRepeat(" ", colName-1-len(truncate(svc.Name, colName-2))) + reset
 				}
 
 				// Tags (join first few tags)
@@ -2451,12 +2635,18 @@ func (m model) View() string {
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
-		if len(m.services) > maxVisibleServices {
-			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.servicesScrollOffset+1, endIndex, len(m.services), reset)
+		if len(filteredServices) > maxVisibleServices {
+			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.servicesScrollOffset+1, endIndex, len(filteredServices), reset)
 		}
 
-		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + scrollIndicator + "\n"
+		// Navigation hint with filter indicator
+		filterHint := ""
+		if m.filterInput != "" {
+			filterHint = "  " + dimmed + "│" + reset + "  " + m.theme.Running + "/" + reset + " Filter: " + bold + m.filterInput + reset
+		} else {
+			filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
+		}
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View" + filterHint + "  " + scrollIndicator + "\n"
 
 	case "node-status":
 		if m.selectedNodeIndex >= 0 && m.selectedNodeIndex < len(m.nodes) {
@@ -2720,7 +2910,18 @@ func (m model) View() string {
 			}
 			content += dimmed + ")" + reset + "\n"
 
-			if len(selectedJob.allocs) > 0 {
+			// Filter allocations if filter is active and in alloc select mode
+			filteredAllocs := selectedJob.allocs
+			if m.filterInput != "" && m.allocSelectMode {
+				filteredAllocs = make([]*api.AllocationListStub, 0)
+				for _, alloc := range selectedJob.allocs {
+					if matchesFilter(alloc.ID, m.filterInput) || matchesFilter(alloc.TaskGroup, m.filterInput) {
+						filteredAllocs = append(filteredAllocs, alloc)
+					}
+				}
+			}
+
+			if len(filteredAllocs) > 0 {
 				// Calculate dynamic column widths for allocations table
 				// 5 columns: ID, TaskGroup, Status, Event, Node
 				allocTableWidth := getTableWidth(m.width, 5)
@@ -2735,10 +2936,10 @@ func (m model) View() string {
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colID-1, "Alloc ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTaskGroup-1, "Task Group") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvent-1, "Last Event") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colNode-1, "Node") + reset + dimmed + "│" + reset + "\n"
 				content += "  " + dimmed + "├" + safeRepeat("─", colID) + "┼" + safeRepeat("─", colTaskGroup) + "┼" + safeRepeat("─", colStatus) + "┼" + safeRepeat("─", colEvent) + "┼" + safeRepeat("─", colNode) + "┤" + reset + "\n"
 
-				maxAllocs := len(selectedJob.allocs)
+				maxAllocs := len(filteredAllocs)
 
 				for i := 0; i < maxAllocs; i++ {
-					alloc := selectedJob.allocs[i]
+					alloc := filteredAllocs[i]
 					allocID := alloc.ID
 					if len(allocID) > 12 {
 						allocID = allocID[:12]
@@ -2755,8 +2956,15 @@ func (m model) View() string {
 						nodeName = truncate(alloc.NodeID[:8], 20)
 					}
 
-					// Task Group
+					// Task Group with filter highlighting
 					taskGroup := truncate(alloc.TaskGroup, colTaskGroup-2)
+					taskGroupField := ""
+					if m.filterInput != "" && m.allocSelectMode && i != m.selectedAllocIndex {
+						taskGroup = highlightMatch(taskGroup, m.filterInput, m.theme.Running, reset)
+						taskGroupField = " " + taskGroup + safeRepeat(" ", colTaskGroup-1-len(truncate(alloc.TaskGroup, colTaskGroup-2)))
+					} else {
+						taskGroupField = fmt.Sprintf(" %-*s", colTaskGroup-1, taskGroup)
+					}
 
 					// Get last event from full allocation info
 					lastEvent := ""
@@ -2774,9 +2982,15 @@ func (m model) View() string {
 						}
 					}
 
-					// Format fields with proper padding
-					idField := fmt.Sprintf(" %-*s", colID-1, allocID)
-					taskGroupField := fmt.Sprintf(" %-*s", colTaskGroup-1, taskGroup)
+					// Format ID field with filter highlighting
+					allocIDDisplay := allocID
+					idField := ""
+					if m.filterInput != "" && m.allocSelectMode && i != m.selectedAllocIndex {
+						allocIDDisplay = highlightMatch(allocIDDisplay, m.filterInput, m.theme.Running, reset)
+						idField = " " + allocIDDisplay + safeRepeat(" ", colID-1-len(allocID))
+					} else {
+						idField = fmt.Sprintf(" %-*s", colID-1, allocID)
+					}
 					// Build status field manually for correct visual width
 					// colStatus = 12: 1 leading space + 1 icon (visual) + 1 space + status + trailing padding
 					// Visual width needed for status + padding = 12 - 3 = 9
@@ -2805,7 +3019,18 @@ func (m model) View() string {
 			// Evaluations section
 			content += "\n  " + bold + cyan + "EVALUATIONS" + reset + "\n"
 
-			if len(selectedJob.evaluations) > 0 {
+			// Filter evaluations if filter is active and in eval select mode
+			filteredEvals := selectedJob.evaluations
+			if m.filterInput != "" && m.evalSelectMode {
+				filteredEvals = make([]*api.Evaluation, 0)
+				for _, eval := range selectedJob.evaluations {
+					if matchesFilter(eval.ID, m.filterInput) || matchesFilter(eval.TriggeredBy, m.filterInput) {
+						filteredEvals = append(filteredEvals, eval)
+					}
+				}
+			}
+
+			if len(filteredEvals) > 0 {
 				// Calculate dynamic column widths for evaluations table
 				// 5 columns: EvalID, Status, TriggeredBy, Placement, Time
 				evalTableWidth := getTableWidth(m.width, 5)
@@ -2820,14 +3045,16 @@ func (m model) View() string {
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalID-1, "Eval ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTriggeredBy-1, "Triggered By") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPlacement-1, "Placement") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + "\n"
 				content += "  " + dimmed + "├" + safeRepeat("─", colEvalID) + "┼" + safeRepeat("─", colEvalStatus) + "┼" + safeRepeat("─", colTriggeredBy) + "┼" + safeRepeat("─", colPlacement) + "┼" + safeRepeat("─", colTime) + "┤" + reset + "\n"
 
-				// Show up to 5 most recent evaluations
+				// Show up to 5 most recent evaluations (or all if filtered)
 				maxEvals := 5
-				if len(selectedJob.evaluations) < maxEvals {
-					maxEvals = len(selectedJob.evaluations)
+				if m.filterInput != "" && m.evalSelectMode {
+					maxEvals = len(filteredEvals)
+				} else if len(filteredEvals) < maxEvals {
+					maxEvals = len(filteredEvals)
 				}
 
 				for i := 0; i < maxEvals; i++ {
-					eval := selectedJob.evaluations[i]
+					eval := filteredEvals[i]
 
 					// Eval ID (truncated)
 					evalID := eval.ID
@@ -2847,8 +3074,15 @@ func (m model) View() string {
 						statusColor = m.theme.Dead
 					}
 
-					// Triggered by
+					// Triggered by with filter highlighting
 					triggeredBy := truncate(eval.TriggeredBy, colTriggeredBy-2)
+					triggeredField := ""
+					if m.filterInput != "" && m.evalSelectMode && i != m.selectedEvalIndex {
+						triggeredBy = highlightMatch(triggeredBy, m.filterInput, m.theme.Running, reset)
+						triggeredField = " " + triggeredBy + safeRepeat(" ", colTriggeredBy-1-len(truncate(eval.TriggeredBy, colTriggeredBy-2)))
+					} else {
+						triggeredField = fmt.Sprintf(" %-*s", colTriggeredBy-1, triggeredBy)
+					}
 
 					// Placement failures indicator
 					placementStatus := "OK"
@@ -2869,10 +3103,15 @@ func (m model) View() string {
 					evalTime := time.Unix(0, eval.CreateTime)
 					timeStr := evalTime.Format("Jan 02 15:04:05")
 
-					// Format fields
-					idField := fmt.Sprintf(" %-*s", colEvalID-1, evalID)
+					// Format fields with filter highlighting
+					idField := ""
+					if m.filterInput != "" && m.evalSelectMode && i != m.selectedEvalIndex {
+						evalIDHighlighted := highlightMatch(evalID, m.filterInput, m.theme.Running, reset)
+						idField = " " + evalIDHighlighted + safeRepeat(" ", colEvalID-1-len(evalID))
+					} else {
+						idField = fmt.Sprintf(" %-*s", colEvalID-1, evalID)
+					}
 					statusField := fmt.Sprintf(" %-*s", colEvalStatus-1, evalStatus)
-					triggeredField := fmt.Sprintf(" %-*s", colTriggeredBy-1, triggeredBy)
 					placementField := fmt.Sprintf(" %-*s", colPlacement-1, placementStatus)
 					timeField := fmt.Sprintf(" %-*s", colTime-1, timeStr)
 
@@ -2950,10 +3189,17 @@ func (m model) View() string {
 			}
 
 			// Clean navigation bar - dynamic based on allocation/evaluation selection mode
+			filterHint := ""
+			if m.filterInput != "" && (m.allocSelectMode || m.evalSelectMode) {
+				filterHint = "  " + dimmed + "│" + reset + "  " + m.theme.Running + "/" + reset + " Filter: " + bold + m.filterInput + reset
+			} else if m.allocSelectMode || m.evalSelectMode {
+				filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
+			}
+
 			if m.allocSelectMode {
-				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
+				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs" + filterHint + "  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
 			} else if m.evalSelectMode {
-				content += "\n  " + m.theme.Pending + "EVAL MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
+				content += "\n  " + m.theme.Pending + "EVAL MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details" + filterHint + "  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
 			} else {
 				content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "a" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "e" + reset + " Select Eval  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
 			}
@@ -3527,6 +3773,30 @@ func (m model) View() string {
 
 		return strings.Join(contentLines, "\n") + "\n"
 	}
+
+	// Show filter overlay if active
+	if m.filterActive {
+		filterOverlay := renderFilterOverlay(m.width, m.height, m.filterInput, m.theme)
+
+		// Split main content and overlay into lines
+		contentLines := strings.Split(mainContent, "\n")
+		overlayLines := strings.Split(filterOverlay, "\n")
+
+		// Ensure content has enough lines
+		for len(contentLines) < m.height {
+			contentLines = append(contentLines, "")
+		}
+
+		// Overlay filter box onto content
+		for i, oLine := range overlayLines {
+			if oLine != "" && i < len(contentLines) {
+				contentLines[i] = oLine
+			}
+		}
+
+		return strings.Join(contentLines, "\n") + "\n"
+	}
+
 	return mainContent
 }
 
