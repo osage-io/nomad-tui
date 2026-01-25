@@ -92,17 +92,22 @@ type model struct {
 	logTaskName          string
 	eventsList           []jobEvent
 	eventsJobName        string
-	scrollOffset         int  // scroll offset for scrollable views (job-status, node-status, cluster)
-	helpScrollOffset     int  // scroll offset for help view
-	jobsScrollOffset     int  // scroll offset for jobs list view
-	nodesScrollOffset    int  // scroll offset for nodes list view
-	servicesScrollOffset int  // scroll offset for services list view
-	allocSelectMode      bool // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
+	scrollOffset         int             // scroll offset for scrollable views (job-status, node-status, cluster)
+	helpScrollOffset     int             // scroll offset for help view
+	jobsScrollOffset     int             // scroll offset for jobs list view
+	nodesScrollOffset    int             // scroll offset for nodes list view
+	servicesScrollOffset int             // scroll offset for services list view
+	allocSelectMode      bool            // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
+	evalSelectMode       bool            // when true, ↑/↓ navigates evaluations instead of scrolling in job-status view
+	selectedEvalIndex    int             // index of selected evaluation in job-status view
+	selectedAlloc        *api.Allocation // currently selected allocation for alloc-detail view
+	selectedEval         *api.Evaluation // currently selected evaluation for eval-detail view
+	previousView         string          // track previous view for back navigation
 	// Blocking query state
-	jobsIndex     uint64 // LastIndex for jobs blocking query
-	nodesIndex    uint64 // LastIndex for nodes blocking query
-	servicesIndex uint64 // LastIndex for services blocking query
-	blockingActive bool  // true when a blocking query goroutine is running
+	jobsIndex      uint64 // LastIndex for jobs blocking query
+	nodesIndex     uint64 // LastIndex for nodes blocking query
+	servicesIndex  uint64 // LastIndex for services blocking query
+	blockingActive bool   // true when a blocking query goroutine is running
 }
 
 type jobEvent struct {
@@ -827,6 +832,46 @@ func fetchEvents(client *api.Client, job *jobStats) tea.Cmd {
 	}
 }
 
+func fetchAllocEvents(client *api.Client, alloc *api.Allocation) tea.Cmd {
+	return func() tea.Msg {
+		var events []jobEvent
+
+		allocIDShort := alloc.ID
+		if len(allocIDShort) > 8 {
+			allocIDShort = allocIDShort[:8]
+		}
+
+		// Iterate through all task states in this allocation
+		for taskName, taskState := range alloc.TaskStates {
+			if taskState != nil && taskState.Events != nil {
+				for _, event := range taskState.Events {
+					events = append(events, jobEvent{
+						Time:    time.Unix(0, event.Time),
+						AllocID: allocIDShort,
+						Task:    taskName,
+						Type:    event.Type,
+						Message: event.DisplayMessage,
+					})
+				}
+			}
+		}
+
+		// Sort events by time (most recent first)
+		sort.Slice(events, func(i, j int) bool {
+			return events[i].Time.After(events[j].Time)
+		})
+
+		if len(events) == 0 {
+			return eventsMsg{err: fmt.Errorf("no events found for allocation %s", allocIDShort)}
+		}
+
+		return eventsMsg{
+			events:  events,
+			jobName: alloc.JobID,
+		}
+	}
+}
+
 func ansiColor(status string, theme Theme) string {
 	switch status {
 	case "running", "ready":
@@ -864,6 +909,13 @@ func calculateColumnWidths(availableWidth int, weights []int, minWidths []int) [
 		return []int{}
 	}
 
+	// Ensure availableWidth is at least 2 per column
+	// (we subtract 1 for padding, so each column needs minimum 2)
+	minRequired := numCols * 2
+	if availableWidth < minRequired {
+		availableWidth = minRequired
+	}
+
 	// Calculate total weight
 	totalWeight := 0
 	for _, w := range weights {
@@ -878,8 +930,16 @@ func calculateColumnWidths(availableWidth int, weights []int, minWidths []int) [
 		widths[i] = min
 	}
 
-	// If available width is less than minimum, just use minimums
+	// If available width is less than minimum, scale down proportionally
 	if availableWidth <= totalMinWidth {
+		// Scale down the minimum widths proportionally
+		for i := range widths {
+			widths[i] = (availableWidth * minWidths[i]) / totalMinWidth
+			// Ensure at least 2 characters per column (we subtract 1 for padding)
+			if widths[i] < 2 {
+				widths[i] = 2
+			}
+		}
 		return widths
 	}
 
@@ -899,6 +959,14 @@ func calculateColumnWidths(availableWidth int, weights []int, minWidths []int) [
 		widths[0] += availableWidth - totalAllocated
 	}
 
+	// Final safety check: ensure minimum width of 2
+	// (we often subtract 1 for padding, so width must be at least 2)
+	for i := range widths {
+		if widths[i] < 2 {
+			widths[i] = 2
+		}
+	}
+
 	return widths
 }
 
@@ -908,8 +976,15 @@ func getTableWidth(termWidth int, numColumns int) int {
 	// 2 for left margin "  ", 1 for each column border (numColumns + 1 total)
 	overhead := 2 + numColumns + 1
 	available := termWidth - overhead
-	if available < numColumns*4 { // minimum 4 chars per column
-		return numColumns * 4
+	minWidth := numColumns * 4 // minimum 4 chars per column
+	if available < minWidth {
+		return minWidth
+	}
+	// Extra safety: ensure we never return a value less than numColumns * 2
+	// (each column needs at least 2 chars because we subtract 1 for padding)
+	minSafeWidth := numColumns * 2
+	if available < minSafeWidth {
+		return minSafeWidth
 	}
 	return available
 }
@@ -925,6 +1000,14 @@ func getBoxWidth(termWidth int) int {
 		boxWidth = 120 // cap at reasonable max
 	}
 	return boxWidth
+}
+
+// safeRepeat safely repeats a string, ensuring count is never negative
+func safeRepeat(s string, count int) string {
+	if count < 0 {
+		return ""
+	}
+	return strings.Repeat(s, count)
 }
 
 func formatAllocStatuses(statuses map[string]int) string {
@@ -961,7 +1044,7 @@ func displayWidth(s string) int {
 // renderHeader creates a consistent box header with proper alignment
 // boxWidth is the inner width (between the ║ characters)
 func renderHeader(title string, boxWidth int, headerColor string, bold string, reset string) string {
-	topBorder := "  " + bold + headerColor + "╔" + strings.Repeat("═", boxWidth) + "╗" + reset + "\n"
+	topBorder := "  " + bold + headerColor + "╔" + safeRepeat("═", boxWidth) + "╗" + reset + "\n"
 
 	// Title with padding (account for 2 spaces before title)
 	// Use displayWidth for proper emoji handling
@@ -970,9 +1053,9 @@ func renderHeader(title string, boxWidth int, headerColor string, bold string, r
 	if padding < 0 {
 		padding = 0
 	}
-	middleLine := "  " + bold + headerColor + "║" + reset + "  " + bold + title + reset + strings.Repeat(" ", padding) + bold + headerColor + "║" + reset + "\n"
+	middleLine := "  " + bold + headerColor + "║" + reset + "  " + bold + title + reset + safeRepeat(" ", padding) + bold + headerColor + "║" + reset + "\n"
 
-	bottomBorder := "  " + bold + headerColor + "╚" + strings.Repeat("═", boxWidth) + "╝" + reset + "\n"
+	bottomBorder := "  " + bold + headerColor + "╚" + safeRepeat("═", boxWidth) + "╝" + reset + "\n"
 
 	return topBorder + middleLine + bottomBorder
 }
@@ -1088,8 +1171,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedJobIndex < len(m.jobs)-1 {
 					m.selectedJobIndex++
 					m.selectedAllocIndex = 0
+					m.selectedEvalIndex = 0
 					m.scrollOffset = 0
 					m.allocSelectMode = false
+					m.evalSelectMode = false
 				}
 			} else if m.view == "node-status" {
 				// Next node
@@ -1106,8 +1191,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedJobIndex > 0 {
 					m.selectedJobIndex--
 					m.selectedAllocIndex = 0
+					m.selectedEvalIndex = 0
 					m.scrollOffset = 0
 					m.allocSelectMode = false
+					m.evalSelectMode = false
 				}
 			} else if m.view == "node-status" {
 				// Previous node
@@ -1118,7 +1205,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "b":
 			if m.view == "job-logs" {
-				m.view = "job-status"
+				// Return to previous view (job-status or alloc-detail)
+				if m.previousView != "" {
+					m.view = m.previousView
+					m.previousView = ""
+				} else {
+					m.view = "job-status"
+				}
 			} else if m.view == "job-events" {
 				m.view = "job-status"
 			}
@@ -1130,15 +1223,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.allocSelectMode {
 					// Exit allocation selection mode first
 					m.allocSelectMode = false
+				} else if m.evalSelectMode {
+					// Exit evaluation selection mode first
+					m.evalSelectMode = false
 				} else {
 					m.view = "jobs"
 				}
 			}
 			if m.view == "job-logs" {
-				m.view = "job-status"
+				// Return to previous view (job-status or alloc-detail)
+				if m.previousView != "" {
+					m.view = m.previousView
+					m.previousView = ""
+				} else {
+					m.view = "job-status"
+				}
 			}
 			if m.view == "job-events" {
 				m.view = "job-status"
+			}
+			if m.view == "alloc-detail" {
+				m.view = "job-status"
+				m.allocSelectMode = false
+			}
+			if m.view == "alloc-events" {
+				// Return to previous view (should be alloc-detail)
+				if m.previousView != "" {
+					m.view = m.previousView
+					m.previousView = ""
+				} else {
+					m.view = "alloc-detail"
+				}
+			}
+			if m.view == "eval-detail" {
+				m.view = "job-status"
+				m.evalSelectMode = false
 			}
 		case "v":
 			m.view = "services"
@@ -1172,6 +1291,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Navigate allocations
 					if m.selectedAllocIndex > 0 {
 						m.selectedAllocIndex--
+					}
+				} else if m.evalSelectMode {
+					// Navigate evaluations
+					if m.selectedEvalIndex > 0 {
+						m.selectedEvalIndex--
 					}
 				} else if m.scrollOffset > 0 {
 					m.scrollOffset--
@@ -1242,6 +1366,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.selectedAllocIndex++
 						}
 					}
+				} else if m.evalSelectMode {
+					// Navigate evaluations
+					if m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
+						selectedJob := m.jobs[m.selectedJobIndex]
+						if m.selectedEvalIndex < len(selectedJob.evaluations)-1 {
+							m.selectedEvalIndex++
+						}
+					}
 				} else {
 					m.scrollOffset++
 				}
@@ -1288,17 +1420,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = "job-status"
 				m.selectedJobIndex = m.selectedIndex
 				m.selectedAllocIndex = 0
+				m.selectedEvalIndex = 0
 				m.scrollOffset = 0
 			}
 			if m.view == "nodes" {
 				m.view = "node-status"
 				m.scrollOffset = 0
 			}
+			// Enter allocation detail view when in allocation selection mode
+			if m.view == "job-status" && m.allocSelectMode && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
+				selectedJob := m.jobs[m.selectedJobIndex]
+				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
+					allocStub := selectedJob.allocs[m.selectedAllocIndex]
+					// Get full allocation from allocMap
+					if fullAlloc, ok := selectedJob.allocMap[allocStub.ID]; ok {
+						m.selectedAlloc = fullAlloc
+						m.view = "alloc-detail"
+						m.scrollOffset = 0
+					}
+				}
+			}
+			// Enter evaluation detail view when in evaluation selection mode
+			if m.view == "job-status" && m.evalSelectMode && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
+				selectedJob := m.jobs[m.selectedJobIndex]
+				if m.selectedEvalIndex >= 0 && m.selectedEvalIndex < len(selectedJob.evaluations) {
+					m.selectedEval = selectedJob.evaluations[m.selectedEvalIndex]
+					m.view = "eval-detail"
+					m.scrollOffset = 0
+				}
+			}
 		case "l":
 			if m.view == "job-status" && len(m.jobs) > 0 && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
 				selectedJob := m.jobs[m.selectedJobIndex]
 				m.logContent = "Loading logs..."
 				m.logJobName = selectedJob.Name
+				m.previousView = m.view
 				m.view = "job-logs"
 				// Use the selected allocation if one is selected and valid
 				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
@@ -1308,13 +1464,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Fall back to finding any running allocation
 				return m, fetchLogs(m.client, selectedJob)
 			}
+			// In alloc-detail view: show allocation logs
+			if m.view == "alloc-detail" && m.selectedAlloc != nil {
+				m.logContent = "Loading logs..."
+				m.logJobName = m.selectedAlloc.JobID
+				m.previousView = m.view
+				m.view = "job-logs"
+				// Convert Allocation to AllocationListStub for fetchAllocLogs
+				allocStub := &api.AllocationListStub{
+					ID:           m.selectedAlloc.ID,
+					JobID:        m.selectedAlloc.JobID,
+					TaskGroup:    m.selectedAlloc.TaskGroup,
+					ClientStatus: m.selectedAlloc.ClientStatus,
+				}
+				return m, fetchAllocLogs(m.client, allocStub, m.selectedAlloc.JobID)
+			}
 		case "e":
+			// In job-status view: enter evaluation selection mode
 			if m.view == "job-status" && len(m.jobs) > 0 && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
 				selectedJob := m.jobs[m.selectedJobIndex]
+				if len(selectedJob.evaluations) > 0 {
+					m.evalSelectMode = !m.evalSelectMode
+					m.allocSelectMode = false // Exit alloc mode if in it
+					if m.evalSelectMode {
+						// Entering eval select mode, ensure valid selection
+						if m.selectedEvalIndex < 0 || m.selectedEvalIndex >= len(selectedJob.evaluations) {
+							m.selectedEvalIndex = 0
+						}
+					}
+				}
+			}
+			// In alloc-detail view: show allocation events
+			if m.view == "alloc-detail" && m.selectedAlloc != nil {
 				m.eventsList = nil
-				m.eventsJobName = selectedJob.Name
-				m.view = "job-events"
-				return m, fetchEvents(m.client, selectedJob)
+				m.eventsJobName = m.selectedAlloc.JobID
+				m.previousView = m.view
+				m.view = "alloc-events"
+				return m, fetchAllocEvents(m.client, m.selectedAlloc)
 			}
 		case "a":
 			// Toggle allocation selection mode in job-status view
@@ -1322,6 +1508,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				selectedJob := m.jobs[m.selectedJobIndex]
 				if len(selectedJob.allocs) > 0 {
 					m.allocSelectMode = !m.allocSelectMode
+					m.evalSelectMode = false // Exit eval mode if in it
 					if m.allocSelectMode {
 						// Entering alloc select mode, ensure valid selection
 						if m.selectedAllocIndex < 0 || m.selectedAllocIndex >= len(selectedJob.allocs) {
@@ -1370,6 +1557,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.jobsIndex = msg.jobsIndex
 		m.nodesIndex = msg.nodesIndex
 		m.servicesIndex = msg.servicesIndex
+
+		// Update selected allocation if we're viewing alloc details
+		if m.view == "alloc-detail" && m.selectedAlloc != nil {
+			// Find the updated allocation data
+			for _, job := range m.jobs {
+				if fullAlloc, ok := job.allocMap[m.selectedAlloc.ID]; ok {
+					m.selectedAlloc = fullAlloc
+					break
+				}
+			}
+		}
+
+		// Update selected evaluation if we're viewing eval details
+		if m.view == "eval-detail" && m.selectedEval != nil && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
+			// Find the updated evaluation data
+			selectedJob := m.jobs[m.selectedJobIndex]
+			for _, eval := range selectedJob.evaluations {
+				if eval.ID == m.selectedEval.ID {
+					m.selectedEval = eval
+					break
+				}
+			}
+		}
+
 		if m.selectedIndex >= len(m.jobs) {
 			m.selectedIndex = 0
 		}
@@ -1482,7 +1693,7 @@ func (m model) View() string {
 			if padding < 0 {
 				padding = 0
 			}
-			return line + strings.Repeat(" ", padding)
+			return line + safeRepeat(" ", padding)
 		}
 
 		// === ROW 1: NAVIGATION header / JOB ACTIONS header ===
@@ -1491,8 +1702,8 @@ func (m model) View() string {
 		helpLines = append(helpLines, padLeft(leftRow, 12)+gap+rightRow)
 
 		// === ROW 2: NAVIGATION top border / JOB ACTIONS top border ===
-		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
+		leftRow = "  " + dimmed + "╭" + safeRepeat("─", colKey) + "┬" + safeRepeat("─", colDesc) + "╮" + reset
+		rightRow = dimmed + "╭" + safeRepeat("─", colKey) + "┬" + safeRepeat("─", colDesc) + "╮" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 3: Column headers ===
@@ -1501,8 +1712,8 @@ func (m model) View() string {
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 4: Separators ===
-		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
+		leftRow = "  " + dimmed + "├" + safeRepeat("─", colKey) + "┼" + safeRepeat("─", colDesc) + "┤" + reset
+		rightRow = dimmed + "├" + safeRepeat("─", colKey) + "┼" + safeRepeat("─", colDesc) + "┤" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 5: j / Enter ===
@@ -1532,11 +1743,11 @@ func (m model) View() string {
 
 		// === ROW 10: ↑ ↓ / bottom of JOB ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "↑ ↓") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Navigate list items") + dimmed + "│" + reset
-		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
+		rightRow = dimmed + "╰" + safeRepeat("─", colKey) + "┴" + safeRepeat("─", colDesc) + "╯" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 11: bottom of NAVIGATION / empty ===
-		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
+		leftRow = "  " + dimmed + "╰" + safeRepeat("─", colKey) + "┴" + safeRepeat("─", colDesc) + "╯" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 12: empty ===
@@ -1548,8 +1759,8 @@ func (m model) View() string {
 		helpLines = append(helpLines, padLeft(leftRow, 9)+gap+rightRow)
 
 		// === ROW 14: GENERAL top border / NODE ACTIONS top border ===
-		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
+		leftRow = "  " + dimmed + "╭" + safeRepeat("─", colKey) + "┬" + safeRepeat("─", colDesc) + "╮" + reset
+		rightRow = dimmed + "╭" + safeRepeat("─", colKey) + "┬" + safeRepeat("─", colDesc) + "╮" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 15: Column headers ===
@@ -1558,8 +1769,8 @@ func (m model) View() string {
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 16: Separators ===
-		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
+		leftRow = "  " + dimmed + "├" + safeRepeat("─", colKey) + "┼" + safeRepeat("─", colDesc) + "┤" + reset
+		rightRow = dimmed + "├" + safeRepeat("─", colKey) + "┼" + safeRepeat("─", colDesc) + "┤" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 17: r / Enter ===
@@ -1569,7 +1780,7 @@ func (m model) View() string {
 
 		// === ROW 18: b / bottom of NODE ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "b") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Go back to previous view") + dimmed + "│" + reset
-		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
+		rightRow = dimmed + "╰" + safeRepeat("─", colKey) + "┴" + safeRepeat("─", colDesc) + "╯" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth)+gap+rightRow)
 
 		// === ROW 19: h / empty ===
@@ -1581,7 +1792,7 @@ func (m model) View() string {
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 21: bottom of GENERAL / empty ===
-		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
+		leftRow = "  " + dimmed + "╰" + safeRepeat("─", colKey) + "┴" + safeRepeat("─", colDesc) + "╯" + reset
 		helpLines = append(helpLines, padLeft(leftRow, leftVisualWidth))
 
 		// === ROW 22: empty ===
@@ -1595,39 +1806,39 @@ func (m model) View() string {
 
 		leftRow = "  " + bold + cyan + "STATUS COLORS" + reset
 		rightRow = bold + cyan + "SERVICE ACTIONS" + reset + "  " + dimmed + "(services view)" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", statusColorsWidth-15+extraPad)+gap+rightRow)
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", statusColorsWidth-15+extraPad)+gap+rightRow)
 
 		// === ROW 24: STATUS COLORS top border / SERVICE ACTIONS top border ===
-		leftRow = "  " + dimmed + "╭" + strings.Repeat("─", colColor) + "┬" + strings.Repeat("─", colMeaning) + "╮" + reset
-		rightRow = dimmed + "╭" + strings.Repeat("─", colKey) + "┬" + strings.Repeat("─", colDesc) + "╮" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
+		leftRow = "  " + dimmed + "╭" + safeRepeat("─", colColor) + "┬" + safeRepeat("─", colMeaning) + "╮" + reset
+		rightRow = dimmed + "╭" + safeRepeat("─", colKey) + "┬" + safeRepeat("─", colDesc) + "╮" + reset
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 25: Column headers ===
 		leftRow = "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colColor-1, "Color") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colMeaning-1, "Meaning") + reset + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colKey-1, "Key") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDesc-1, "Action") + reset + dimmed + "│" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 26: Separators ===
-		leftRow = "  " + dimmed + "├" + strings.Repeat("─", colColor) + "┼" + strings.Repeat("─", colMeaning) + "┤" + reset
-		rightRow = dimmed + "├" + strings.Repeat("─", colKey) + "┼" + strings.Repeat("─", colDesc) + "┤" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
+		leftRow = "  " + dimmed + "├" + safeRepeat("─", colColor) + "┼" + safeRepeat("─", colMeaning) + "┤" + reset
+		rightRow = dimmed + "├" + safeRepeat("─", colKey) + "┼" + safeRepeat("─", colDesc) + "┤" + reset
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 27: Green / ↑ ↓ ===
 		leftRow = "  " + dimmed + "│" + reset + " " + green + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Green") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Running / Ready") + dimmed + "│" + reset
 		rightRow = dimmed + "│" + reset + " " + keyColor + fmt.Sprintf("%-*s", colKey-1, "↑ ↓") + reset + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colDesc-1, "Navigate services") + dimmed + "│" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 28: Yellow / bottom of SERVICE ACTIONS ===
 		leftRow = "  " + dimmed + "│" + reset + " " + yellow + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Yellow") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Pending") + dimmed + "│" + reset
-		rightRow = dimmed + "╰" + strings.Repeat("─", colKey) + "┴" + strings.Repeat("─", colDesc) + "╯" + reset
-		helpLines = append(helpLines, leftRow+strings.Repeat(" ", extraPad)+gap+rightRow)
+		rightRow = dimmed + "╰" + safeRepeat("─", colKey) + "┴" + safeRepeat("─", colDesc) + "╯" + reset
+		helpLines = append(helpLines, leftRow+safeRepeat(" ", extraPad)+gap+rightRow)
 
 		// === ROW 29: Red / empty ===
 		leftRow = "  " + dimmed + "│" + reset + " " + red + "●" + reset + fmt.Sprintf(" %-*s", colColor-3, "Red") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colMeaning-1, "Dead / Failed") + dimmed + "│" + reset
 		helpLines = append(helpLines, leftRow)
 
 		// === ROW 30: bottom of STATUS COLORS ===
-		leftRow = "  " + dimmed + "╰" + strings.Repeat("─", colColor) + "┴" + strings.Repeat("─", colMeaning) + "╯" + reset
+		leftRow = "  " + dimmed + "╰" + safeRepeat("─", colColor) + "┴" + safeRepeat("─", colMeaning) + "╯" + reset
 		helpLines = append(helpLines, leftRow)
 
 		// === ROW 31: empty for spacing ===
@@ -1637,13 +1848,13 @@ func (m model) View() string {
 		helpLines = append(helpLines, "  "+bold+cyan+"ALLOCATION ACTIONS"+reset+"  "+dimmed+"(job-status view, press 'a' to enter alloc mode)"+reset)
 
 		// === ROW 33: ALLOCATION ACTIONS top border ===
-		helpLines = append(helpLines, "  "+dimmed+"╭"+strings.Repeat("─", colKey)+"┬"+strings.Repeat("─", colDesc)+"╮"+reset)
+		helpLines = append(helpLines, "  "+dimmed+"╭"+safeRepeat("─", colKey)+"┬"+safeRepeat("─", colDesc)+"╮"+reset)
 
 		// === ROW 34: Column headers ===
 		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+bold+fmt.Sprintf("%-*s", colKey-1, "Key")+reset+dimmed+"│"+reset+" "+bold+fmt.Sprintf("%-*s", colDesc-1, "Action")+reset+dimmed+"│"+reset)
 
 		// === ROW 35: Separator ===
-		helpLines = append(helpLines, "  "+dimmed+"├"+strings.Repeat("─", colKey)+"┼"+strings.Repeat("─", colDesc)+"┤"+reset)
+		helpLines = append(helpLines, "  "+dimmed+"├"+safeRepeat("─", colKey)+"┼"+safeRepeat("─", colDesc)+"┤"+reset)
 
 		// === ROW 36: a ===
 		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "a")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "Toggle alloc select mode")+dimmed+"│"+reset)
@@ -1661,7 +1872,7 @@ func (m model) View() string {
 		helpLines = append(helpLines, "  "+dimmed+"│"+reset+" "+keyColor+fmt.Sprintf("%-*s", colKey-1, "l")+reset+dimmed+"│"+reset+fmt.Sprintf(" %-*s", colDesc-1, "View allocation logs")+dimmed+"│"+reset)
 
 		// === ROW 41: bottom border ===
-		helpLines = append(helpLines, "  "+dimmed+"╰"+strings.Repeat("─", colKey)+"┴"+strings.Repeat("─", colDesc)+"╯"+reset)
+		helpLines = append(helpLines, "  "+dimmed+"╰"+safeRepeat("─", colKey)+"┴"+safeRepeat("─", colDesc)+"╯"+reset)
 
 		// Build header (no leading newline to avoid cutting off top border)
 		header := renderHeader("❓ KEYBOARD SHORTCUTS", boxWidth, m.theme.Header, bold, reset) + "\n"
@@ -1678,7 +1889,7 @@ func (m model) View() string {
 		if rightPad < 0 {
 			rightPad = 0
 		}
-		footerBar := "\033[48;5;237m" + "\033[37m" + strings.Repeat(" ", leftPad) + "Press '\033[38;5;51mh\033[37m' for help, '\033[38;5;204mq\033[37m' for quit" + strings.Repeat(" ", rightPad) + "\033[0m"
+		footerBar := "\033[48;5;237m" + "\033[37m" + safeRepeat(" ", leftPad) + "Press '\033[38;5;51mh\033[37m' for help, '\033[38;5;204mq\033[37m' for quit" + safeRepeat(" ", rightPad) + "\033[0m"
 
 		// Calculate visible content area
 		// Header takes ~5 lines, footer hint + separator + footer bar = 3 lines
@@ -1712,7 +1923,7 @@ func (m model) View() string {
 		result := header
 		result += strings.Join(visibleHelp, "\n") + "\n"
 		result += "\n" + footerHint + "\n"
-		result += strings.Repeat("─", m.width) + "\n"
+		result += safeRepeat("─", m.width) + "\n"
 		result += footerBar + "\n"
 
 		return result
@@ -1760,9 +1971,9 @@ func (m model) View() string {
 		colUptime := jobColWidths[4]
 
 		// Table header with rounded corners
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colType) + "┬" + strings.Repeat("─", colPool) + "┬" + strings.Repeat("─", colUptime) + "╮" + reset + "\n"
+		content += "  " + dimmed + "╭" + safeRepeat("─", colName) + "┬" + safeRepeat("─", colStatus) + "┬" + safeRepeat("─", colType) + "┬" + safeRepeat("─", colPool) + "┬" + safeRepeat("─", colUptime) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Job Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPool-1, "Node Pool") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colUptime-1, "Uptime") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colType) + "┼" + strings.Repeat("─", colPool) + "┼" + strings.Repeat("─", colUptime) + "┤" + reset + "\n"
+		content += "  " + dimmed + "├" + safeRepeat("─", colName) + "┼" + safeRepeat("─", colStatus) + "┼" + safeRepeat("─", colType) + "┼" + safeRepeat("─", colPool) + "┼" + safeRepeat("─", colUptime) + "┤" + reset + "\n"
 
 		// Calculate how many jobs can be displayed
 		// Chrome lines breakdown:
@@ -1838,7 +2049,7 @@ func (m model) View() string {
 			content += "  " + dimmed + "│" + reset + nameField + dimmed + "│" + reset + statusField + dimmed + "│" + reset + typeField + dimmed + "│" + reset + nodePoolField + dimmed + "│" + reset + durationField + dimmed + "│" + reset + "\n"
 		}
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colType) + "┴" + strings.Repeat("─", colPool) + "┴" + strings.Repeat("─", colUptime) + "╯" + reset + "\n"
+		content += "  " + dimmed + "╰" + safeRepeat("─", colName) + "┴" + safeRepeat("─", colStatus) + "┴" + safeRepeat("─", colType) + "┴" + safeRepeat("─", colPool) + "┴" + safeRepeat("─", colUptime) + "╯" + reset + "\n"
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
@@ -1881,9 +2092,9 @@ func (m model) View() string {
 		colIP := nodeColWidths[6]
 
 		// Table header with rounded corners
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colID) + "┬" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colDC) + "┬" + strings.Repeat("─", colOS) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colVersion) + "┬" + strings.Repeat("─", colIP) + "╮" + reset + "\n"
+		content += "  " + dimmed + "╭" + safeRepeat("─", colID) + "┬" + safeRepeat("─", colName) + "┬" + safeRepeat("─", colDC) + "┬" + safeRepeat("─", colOS) + "┬" + safeRepeat("─", colStatus) + "┬" + safeRepeat("─", colVersion) + "┬" + safeRepeat("─", colIP) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colID-1, "ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colDC-1, "DC") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colOS-1, "OS") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colVersion-1, "Version") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colIP-1, "IP") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colID) + "┼" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colDC) + "┼" + strings.Repeat("─", colOS) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colVersion) + "┼" + strings.Repeat("─", colIP) + "┤" + reset + "\n"
+		content += "  " + dimmed + "├" + safeRepeat("─", colID) + "┼" + safeRepeat("─", colName) + "┼" + safeRepeat("─", colDC) + "┼" + safeRepeat("─", colOS) + "┼" + safeRepeat("─", colStatus) + "┼" + safeRepeat("─", colVersion) + "┼" + safeRepeat("─", colIP) + "┤" + reset + "\n"
 
 		// Calculate how many nodes can be displayed
 		// Chrome lines breakdown: same as jobs = 15 lines
@@ -1968,7 +2179,7 @@ func (m model) View() string {
 			content += "  " + dimmed + "│" + reset + idField + dimmed + "│" + reset + nameField + dimmed + "│" + reset + dcField + dimmed + "│" + reset + osField + dimmed + "│" + reset + statusField + dimmed + "│" + reset + versionField + dimmed + "│" + reset + ipField + dimmed + "│" + reset + "\n"
 		}
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colID) + "┴" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colDC) + "┴" + strings.Repeat("─", colOS) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colVersion) + "┴" + strings.Repeat("─", colIP) + "╯" + reset + "\n"
+		content += "  " + dimmed + "╰" + safeRepeat("─", colID) + "┴" + safeRepeat("─", colName) + "┴" + safeRepeat("─", colDC) + "┴" + safeRepeat("─", colOS) + "┴" + safeRepeat("─", colStatus) + "┴" + safeRepeat("─", colVersion) + "┴" + safeRepeat("─", colIP) + "╯" + reset + "\n"
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
@@ -2016,9 +2227,9 @@ func (m model) View() string {
 		colStatus := clusterColWidths[2]
 
 		content += "  " + bold + cyan + "CLUSTER STATUS" + reset + "\n"
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colLabel) + "┬" + strings.Repeat("─", colValue) + "┬" + strings.Repeat("─", colStatus) + "╮" + reset + "\n"
+		content += "  " + dimmed + "╭" + safeRepeat("─", colLabel) + "┬" + safeRepeat("─", colValue) + "┬" + safeRepeat("─", colStatus) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colLabel-1, "Resource") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colValue-1, "Total") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colLabel) + "┼" + strings.Repeat("─", colValue) + "┼" + strings.Repeat("─", colStatus) + "┤" + reset + "\n"
+		content += "  " + dimmed + "├" + safeRepeat("─", colLabel) + "┼" + safeRepeat("─", colValue) + "┼" + safeRepeat("─", colStatus) + "┤" + reset + "\n"
 
 		// Nodes row
 		nodesStatus := m.theme.Running + "●" + reset + " " + fmt.Sprintf("%d ready", readyNodes)
@@ -2032,7 +2243,7 @@ func (m model) View() string {
 		if nodesPadding < 0 {
 			nodesPadding = 0
 		}
-		content += "  " + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colLabel-1, "Nodes") + dimmed + "│" + reset + fmt.Sprintf(" %-*d", colValue-1, len(m.nodes)) + dimmed + "│" + reset + " " + nodesStatus + strings.Repeat(" ", nodesPadding) + dimmed + "│" + reset + "\n"
+		content += "  " + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colLabel-1, "Nodes") + dimmed + "│" + reset + fmt.Sprintf(" %-*d", colValue-1, len(m.nodes)) + dimmed + "│" + reset + " " + nodesStatus + safeRepeat(" ", nodesPadding) + dimmed + "│" + reset + "\n"
 
 		// Jobs row
 		jobsStatus := m.theme.Running + "●" + reset + " " + fmt.Sprintf("%d run", runningJobs)
@@ -2049,9 +2260,9 @@ func (m model) View() string {
 		if jobsPadding < 0 {
 			jobsPadding = 0
 		}
-		content += "  " + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colLabel-1, "Jobs") + dimmed + "│" + reset + fmt.Sprintf(" %-*d", colValue-1, len(m.jobs)) + dimmed + "│" + reset + " " + jobsStatus + strings.Repeat(" ", jobsPadding) + dimmed + "│" + reset + "\n"
+		content += "  " + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colLabel-1, "Jobs") + dimmed + "│" + reset + fmt.Sprintf(" %-*d", colValue-1, len(m.jobs)) + dimmed + "│" + reset + " " + jobsStatus + safeRepeat(" ", jobsPadding) + dimmed + "│" + reset + "\n"
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colLabel) + "┴" + strings.Repeat("─", colValue) + "┴" + strings.Repeat("─", colStatus) + "╯" + reset + "\n\n"
+		content += "  " + dimmed + "╰" + safeRepeat("─", colLabel) + "┴" + safeRepeat("─", colValue) + "┴" + safeRepeat("─", colStatus) + "╯" + reset + "\n\n"
 
 		// CPU Section
 		capacityGHz := float64(m.totalCapacityCPU) / 1000
@@ -2094,9 +2305,9 @@ func (m model) View() string {
 		colUtil := resColWidths[4]
 
 		content += "  " + bold + cyan + "RESOURCE UTILIZATION" + reset + "\n"
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colResource) + "┬" + strings.Repeat("─", colCapacity) + "┬" + strings.Repeat("─", colAllocated) + "┬" + strings.Repeat("─", colAvailable) + "┬" + strings.Repeat("─", colUtil) + "╮" + reset + "\n"
+		content += "  " + dimmed + "╭" + safeRepeat("─", colResource) + "┬" + safeRepeat("─", colCapacity) + "┬" + safeRepeat("─", colAllocated) + "┬" + safeRepeat("─", colAvailable) + "┬" + safeRepeat("─", colUtil) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colResource-1, "Resource") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colCapacity-1, "Capacity") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAllocated-1, "Allocated") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAvailable-1, "Available") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colUtil-1, "Used") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colResource) + "┼" + strings.Repeat("─", colCapacity) + "┼" + strings.Repeat("─", colAllocated) + "┼" + strings.Repeat("─", colAvailable) + "┼" + strings.Repeat("─", colUtil) + "┤" + reset + "\n"
+		content += "  " + dimmed + "├" + safeRepeat("─", colResource) + "┼" + safeRepeat("─", colCapacity) + "┼" + safeRepeat("─", colAllocated) + "┼" + safeRepeat("─", colAvailable) + "┼" + safeRepeat("─", colUtil) + "┤" + reset + "\n"
 
 		// CPU row
 		cpuUtilStr := fmt.Sprintf("%.1f%%", utilCPU)
@@ -2106,7 +2317,7 @@ func (m model) View() string {
 		memUtilStr := fmt.Sprintf("%.1f%%", utilMem)
 		content += "  " + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colResource-1, "Memory") + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colCapacity-1, fmt.Sprintf("%.1f GB", capacityGB)) + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colAllocated-1, fmt.Sprintf("%.1f GB", allocatedGB)) + dimmed + "│" + reset + fmt.Sprintf(" %-*s", colAvailable-1, fmt.Sprintf("%.1f GB", availableGB)) + dimmed + "│" + reset + " " + memColor + fmt.Sprintf("%-*s", colUtil-1, memUtilStr) + reset + dimmed + "│" + reset + "\n"
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colResource) + "┴" + strings.Repeat("─", colCapacity) + "┴" + strings.Repeat("─", colAllocated) + "┴" + strings.Repeat("─", colAvailable) + "┴" + strings.Repeat("─", colUtil) + "╯" + reset + "\n\n"
+		content += "  " + dimmed + "╰" + safeRepeat("─", colResource) + "┴" + safeRepeat("─", colCapacity) + "┴" + safeRepeat("─", colAllocated) + "┴" + safeRepeat("─", colAvailable) + "┴" + safeRepeat("─", colUtil) + "╯" + reset + "\n\n"
 
 		// Progress bars section - dynamic width based on terminal
 		barWidth := m.width - 20 // Leave room for label and percentage
@@ -2124,7 +2335,7 @@ func (m model) View() string {
 		if filledWidth > barWidth {
 			filledWidth = barWidth
 		}
-		cpuBar := cpuColor + strings.Repeat("█", filledWidth) + reset + dimmed + strings.Repeat("░", barWidth-filledWidth) + reset
+		cpuBar := cpuColor + safeRepeat("█", filledWidth) + reset + dimmed + safeRepeat("░", barWidth-filledWidth) + reset
 		content += "  " + dimmed + "CPU" + reset + "     " + cpuBar + " " + cpuColor + fmt.Sprintf("%5.1f%%", utilCPU) + reset + "\n"
 
 		// Memory Progress bar
@@ -2132,7 +2343,7 @@ func (m model) View() string {
 		if memFilledWidth > barWidth {
 			memFilledWidth = barWidth
 		}
-		memBar := memColor + strings.Repeat("█", memFilledWidth) + reset + dimmed + strings.Repeat("░", barWidth-memFilledWidth) + reset
+		memBar := memColor + safeRepeat("█", memFilledWidth) + reset + dimmed + safeRepeat("░", barWidth-memFilledWidth) + reset
 		content += "  " + dimmed + "Memory" + reset + "  " + memBar + " " + memColor + fmt.Sprintf("%5.1f%%", utilMem) + reset + "\n"
 
 		// Navigation hint
@@ -2158,9 +2369,9 @@ func (m model) View() string {
 		colNode := svcColWidths[5]
 
 		// Table header with rounded corners
-		content += "  " + dimmed + "╭" + strings.Repeat("─", colName) + "┬" + strings.Repeat("─", colTags) + "┬" + strings.Repeat("─", colAddress) + "┬" + strings.Repeat("─", colPort) + "┬" + strings.Repeat("─", colJob) + "┬" + strings.Repeat("─", colNode) + "╮" + reset + "\n"
+		content += "  " + dimmed + "╭" + safeRepeat("─", colName) + "┬" + safeRepeat("─", colTags) + "┬" + safeRepeat("─", colAddress) + "┬" + safeRepeat("─", colPort) + "┬" + safeRepeat("─", colJob) + "┬" + safeRepeat("─", colNode) + "╮" + reset + "\n"
 		content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colName-1, "Service Name") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTags-1, "Tags") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAddress-1, "Address") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPort-1, "Port") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colJob-1, "Job") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colNode-1, "Node") + reset + dimmed + "│" + reset + "\n"
-		content += "  " + dimmed + "├" + strings.Repeat("─", colName) + "┼" + strings.Repeat("─", colTags) + "┼" + strings.Repeat("─", colAddress) + "┼" + strings.Repeat("─", colPort) + "┼" + strings.Repeat("─", colJob) + "┼" + strings.Repeat("─", colNode) + "┤" + reset + "\n"
+		content += "  " + dimmed + "├" + safeRepeat("─", colName) + "┼" + safeRepeat("─", colTags) + "┼" + safeRepeat("─", colAddress) + "┼" + safeRepeat("─", colPort) + "┼" + safeRepeat("─", colJob) + "┼" + safeRepeat("─", colNode) + "┤" + reset + "\n"
 
 		// Calculate how many services can be displayed
 		// Chrome lines breakdown: same as jobs = 15 lines
@@ -2195,7 +2406,7 @@ func (m model) View() string {
 			// Empty state
 			emptyMsg := "No services registered"
 			emptyPadding := (colName + colTags + colAddress + colPort + colJob + colNode + 5 - len(emptyMsg)) / 2
-			content += "  " + dimmed + "│" + reset + strings.Repeat(" ", emptyPadding) + dimmed + emptyMsg + reset + strings.Repeat(" ", colName+colTags+colAddress+colPort+colJob+colNode+5-emptyPadding-len(emptyMsg)) + dimmed + "│" + reset + "\n"
+			content += "  " + dimmed + "│" + reset + safeRepeat(" ", emptyPadding) + dimmed + emptyMsg + reset + safeRepeat(" ", colName+colTags+colAddress+colPort+colJob+colNode+5-emptyPadding-len(emptyMsg)) + dimmed + "│" + reset + "\n"
 		} else {
 			for i := m.servicesScrollOffset; i < endIndex; i++ {
 				svc := m.services[i]
@@ -2236,7 +2447,7 @@ func (m model) View() string {
 			}
 		}
 
-		content += "  " + dimmed + "╰" + strings.Repeat("─", colName) + "┴" + strings.Repeat("─", colTags) + "┴" + strings.Repeat("─", colAddress) + "┴" + strings.Repeat("─", colPort) + "┴" + strings.Repeat("─", colJob) + "┴" + strings.Repeat("─", colNode) + "╯" + reset + "\n"
+		content += "  " + dimmed + "╰" + safeRepeat("─", colName) + "┴" + safeRepeat("─", colTags) + "┴" + safeRepeat("─", colAddress) + "┴" + safeRepeat("─", colPort) + "┴" + safeRepeat("─", colJob) + "┴" + safeRepeat("─", colNode) + "╯" + reset + "\n"
 
 		// Scroll indicator (if list is scrollable)
 		scrollIndicator := ""
@@ -2273,7 +2484,7 @@ func (m model) View() string {
 
 			// Basic Info Section
 			content += "  " + bold + cyan + "BASIC INFORMATION" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
+			content += "  " + dimmed + safeRepeat("─", separatorWidth) + reset + "\n"
 			content += "  " + dimmed + "Datacenter:" + reset + "   " + selectedNode.datacenter + "\n"
 			content += "  " + dimmed + "Node Pool:" + reset + "    " + selectedNode.nodePool + "\n"
 
@@ -2293,7 +2504,7 @@ func (m model) View() string {
 
 			// Resources Section
 			content += "  " + bold + cyan + "RESOURCES" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
+			content += "  " + dimmed + safeRepeat("─", separatorWidth) + reset + "\n"
 
 			if selectedNode.fullNode != nil {
 				totalCPU := 0
@@ -2339,7 +2550,7 @@ func (m model) View() string {
 						barWidth = 40
 					}
 					filledWidth := int(cpuUtil / 100 * float64(barWidth))
-					cpuBar := cpuColor + strings.Repeat("█", filledWidth) + reset + dimmed + strings.Repeat("░", barWidth-filledWidth) + reset
+					cpuBar := cpuColor + safeRepeat("█", filledWidth) + reset + dimmed + safeRepeat("░", barWidth-filledWidth) + reset
 					content += "  " + dimmed + "CPU:" + reset + "  " + cpuBar + fmt.Sprintf(" %d / %d MHz", allocatedCPU, totalCPU) + "\n"
 				}
 
@@ -2360,7 +2571,7 @@ func (m model) View() string {
 						barWidth = 40
 					}
 					filledWidth := int(memUtil / 100 * float64(barWidth))
-					memBar := memColor + strings.Repeat("█", filledWidth) + reset + dimmed + strings.Repeat("░", barWidth-filledWidth) + reset
+					memBar := memColor + safeRepeat("█", filledWidth) + reset + dimmed + safeRepeat("░", barWidth-filledWidth) + reset
 					content += "  " + dimmed + "Mem:" + reset + "  " + memBar + fmt.Sprintf(" %d / %d MB", allocatedMemMB, totalMemMB) + "\n"
 				}
 			} else {
@@ -2371,7 +2582,7 @@ func (m model) View() string {
 
 			// Drivers & Volumes Section
 			content += "  " + bold + cyan + "CAPABILITIES" + reset + "\n"
-			content += "  " + dimmed + strings.Repeat("─", separatorWidth) + reset + "\n"
+			content += "  " + dimmed + safeRepeat("─", separatorWidth) + reset + "\n"
 			content += "  " + dimmed + "Drivers:" + reset + "      "
 			if len(selectedNode.drivers) > 0 {
 				content += strings.Join(selectedNode.drivers, ", ")
@@ -2457,16 +2668,16 @@ func (m model) View() string {
 			}
 
 			// Top border
-			content += "  " + dimmed + "╭" + strings.Repeat("─", cardWidth) + "╮" + reset + gap
-			content += dimmed + "╭" + strings.Repeat("─", cardWidth) + "╮" + reset + "\n"
+			content += "  " + dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + gap
+			content += dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + "\n"
 
 			// Card headers
-			content += "  " + dimmed + "│" + reset + " " + bold + cyan + "CONFIGURATION" + reset + strings.Repeat(" ", cardWidth-14) + dimmed + "│" + reset + gap
-			content += dimmed + "│" + reset + " " + bold + cyan + "RESOURCES" + reset + strings.Repeat(" ", cardWidth-10) + dimmed + "│" + reset + "\n"
+			content += "  " + dimmed + "│" + reset + " " + bold + cyan + "CONFIGURATION" + reset + safeRepeat(" ", cardWidth-14) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + " " + bold + cyan + "RESOURCES" + reset + safeRepeat(" ", cardWidth-10) + dimmed + "│" + reset + "\n"
 
 			// Separator
-			content += "  " + dimmed + "├" + strings.Repeat("─", cardWidth) + "┤" + reset + gap
-			content += dimmed + "├" + strings.Repeat("─", cardWidth) + "┤" + reset + "\n"
+			content += "  " + dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + gap
+			content += dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + "\n"
 
 			// Row 1: Type | CPU
 			content += "  " + dimmed + "│" + reset + cardRow("Type", selectedJob.Type) + dimmed + "│" + reset + gap
@@ -2478,11 +2689,11 @@ func (m model) View() string {
 
 			// Row 3: Uptime | (empty padding)
 			content += "  " + dimmed + "│" + reset + cardRow("Uptime", durationStr) + dimmed + "│" + reset + gap
-			content += dimmed + "│" + reset + strings.Repeat(" ", cardWidth) + dimmed + "│" + reset + "\n"
+			content += dimmed + "│" + reset + safeRepeat(" ", cardWidth) + dimmed + "│" + reset + "\n"
 
 			// Bottom border
-			content += "  " + dimmed + "╰" + strings.Repeat("─", cardWidth) + "╯" + reset + gap
-			content += dimmed + "╰" + strings.Repeat("─", cardWidth) + "╯" + reset + "\n\n"
+			content += "  " + dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + gap
+			content += dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + "\n\n"
 
 			// Allocations section with summary badges
 			runningAllocs := 0
@@ -2520,9 +2731,9 @@ func (m model) View() string {
 				colEvent := allocColWidths[3]
 				colNode := allocColWidths[4]
 
-				content += "  " + dimmed + "╭" + strings.Repeat("─", colID) + "┬" + strings.Repeat("─", colTaskGroup) + "┬" + strings.Repeat("─", colStatus) + "┬" + strings.Repeat("─", colEvent) + "┬" + strings.Repeat("─", colNode) + "╮" + reset + "\n"
+				content += "  " + dimmed + "╭" + safeRepeat("─", colID) + "┬" + safeRepeat("─", colTaskGroup) + "┬" + safeRepeat("─", colStatus) + "┬" + safeRepeat("─", colEvent) + "┬" + safeRepeat("─", colNode) + "╮" + reset + "\n"
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colID-1, "Alloc ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTaskGroup-1, "Task Group") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvent-1, "Last Event") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colNode-1, "Node") + reset + dimmed + "│" + reset + "\n"
-				content += "  " + dimmed + "├" + strings.Repeat("─", colID) + "┼" + strings.Repeat("─", colTaskGroup) + "┼" + strings.Repeat("─", colStatus) + "┼" + strings.Repeat("─", colEvent) + "┼" + strings.Repeat("─", colNode) + "┤" + reset + "\n"
+				content += "  " + dimmed + "├" + safeRepeat("─", colID) + "┼" + safeRepeat("─", colTaskGroup) + "┼" + safeRepeat("─", colStatus) + "┼" + safeRepeat("─", colEvent) + "┼" + safeRepeat("─", colNode) + "┤" + reset + "\n"
 
 				maxAllocs := len(selectedJob.allocs)
 
@@ -2575,7 +2786,7 @@ func (m model) View() string {
 					if statusPadding < 0 {
 						statusPadding = 0
 					}
-					statusField := " " + statusText + strings.Repeat(" ", statusPadding)
+					statusField := " " + statusText + safeRepeat(" ", statusPadding)
 					eventField := fmt.Sprintf(" %-*s", colEvent-1, truncate(lastEvent, colEvent-2))
 					nodeField := fmt.Sprintf(" %-*s", colNode-1, nodeName)
 
@@ -2586,7 +2797,7 @@ func (m model) View() string {
 					}
 				}
 
-				content += "  " + dimmed + "╰" + strings.Repeat("─", colID) + "┴" + strings.Repeat("─", colTaskGroup) + "┴" + strings.Repeat("─", colStatus) + "┴" + strings.Repeat("─", colEvent) + "┴" + strings.Repeat("─", colNode) + "╯" + reset + "\n"
+				content += "  " + dimmed + "╰" + safeRepeat("─", colID) + "┴" + safeRepeat("─", colTaskGroup) + "┴" + safeRepeat("─", colStatus) + "┴" + safeRepeat("─", colEvent) + "┴" + safeRepeat("─", colNode) + "╯" + reset + "\n"
 			} else {
 				content += "  " + dimmed + "No allocations" + reset + "\n"
 			}
@@ -2605,9 +2816,9 @@ func (m model) View() string {
 				colPlacement := evalColWidths[3]
 				colTime := evalColWidths[4]
 
-				content += "  " + dimmed + "╭" + strings.Repeat("─", colEvalID) + "┬" + strings.Repeat("─", colEvalStatus) + "┬" + strings.Repeat("─", colTriggeredBy) + "┬" + strings.Repeat("─", colPlacement) + "┬" + strings.Repeat("─", colTime) + "╮" + reset + "\n"
+				content += "  " + dimmed + "╭" + safeRepeat("─", colEvalID) + "┬" + safeRepeat("─", colEvalStatus) + "┬" + safeRepeat("─", colTriggeredBy) + "┬" + safeRepeat("─", colPlacement) + "┬" + safeRepeat("─", colTime) + "╮" + reset + "\n"
 				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalID-1, "Eval ID") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colEvalStatus-1, "Status") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTriggeredBy-1, "Triggered By") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colPlacement-1, "Placement") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + "\n"
-				content += "  " + dimmed + "├" + strings.Repeat("─", colEvalID) + "┼" + strings.Repeat("─", colEvalStatus) + "┼" + strings.Repeat("─", colTriggeredBy) + "┼" + strings.Repeat("─", colPlacement) + "┼" + strings.Repeat("─", colTime) + "┤" + reset + "\n"
+				content += "  " + dimmed + "├" + safeRepeat("─", colEvalID) + "┼" + safeRepeat("─", colEvalStatus) + "┼" + safeRepeat("─", colTriggeredBy) + "┼" + safeRepeat("─", colPlacement) + "┼" + safeRepeat("─", colTime) + "┤" + reset + "\n"
 
 				// Show up to 5 most recent evaluations
 				maxEvals := 5
@@ -2665,10 +2876,15 @@ func (m model) View() string {
 					placementField := fmt.Sprintf(" %-*s", colPlacement-1, placementStatus)
 					timeField := fmt.Sprintf(" %-*s", colTime-1, timeStr)
 
-					content += "  " + dimmed + "│" + reset + idField + dimmed + "│" + reset + statusColor + statusField + reset + dimmed + "│" + reset + triggeredField + dimmed + "│" + reset + placementColor + placementField + reset + dimmed + "│" + reset + timeField + dimmed + "│" + reset + "\n"
+					// Highlight selected evaluation when in eval select mode
+					if i == m.selectedEvalIndex && m.evalSelectMode {
+						content += "  " + dimmed + "│" + reset + bold + m.theme.HighlightBg + "\033[30m" + idField + reset + dimmed + "│" + reset + statusColor + statusField + reset + dimmed + "│" + reset + triggeredField + dimmed + "│" + reset + placementColor + placementField + reset + dimmed + "│" + reset + timeField + dimmed + "│" + reset + "\n"
+					} else {
+						content += "  " + dimmed + "│" + reset + idField + dimmed + "│" + reset + statusColor + statusField + reset + dimmed + "│" + reset + triggeredField + dimmed + "│" + reset + placementColor + placementField + reset + dimmed + "│" + reset + timeField + dimmed + "│" + reset + "\n"
+					}
 				}
 
-				content += "  " + dimmed + "╰" + strings.Repeat("─", colEvalID) + "┴" + strings.Repeat("─", colEvalStatus) + "┴" + strings.Repeat("─", colTriggeredBy) + "┴" + strings.Repeat("─", colPlacement) + "┴" + strings.Repeat("─", colTime) + "╯" + reset + "\n"
+				content += "  " + dimmed + "╰" + safeRepeat("─", colEvalID) + "┴" + safeRepeat("─", colEvalStatus) + "┴" + safeRepeat("─", colTriggeredBy) + "┴" + safeRepeat("─", colPlacement) + "┴" + safeRepeat("─", colTime) + "╯" + reset + "\n"
 			} else {
 				content += "  " + dimmed + "No evaluations" + reset + "\n"
 			}
@@ -2678,9 +2894,9 @@ func (m model) View() string {
 				content += "\n  " + bold + m.theme.Dead + "⚠ PLACEMENT FAILURES" + reset + "\n"
 
 				for taskGroup, metrics := range selectedJob.placementFailures {
-					content += "  " + dimmed + "╭" + strings.Repeat("─", 76) + "╮" + reset + "\n"
-					content += "  " + dimmed + "│" + reset + " " + bold + "Task Group: " + reset + white + taskGroup + reset + strings.Repeat(" ", 76-14-len(taskGroup)) + dimmed + "│" + reset + "\n"
-					content += "  " + dimmed + "├" + strings.Repeat("─", 76) + "┤" + reset + "\n"
+					content += "  " + dimmed + "╭" + safeRepeat("─", 76) + "╮" + reset + "\n"
+					content += "  " + dimmed + "│" + reset + " " + bold + "Task Group: " + reset + white + taskGroup + reset + safeRepeat(" ", 76-14-len(taskGroup)) + dimmed + "│" + reset + "\n"
+					content += "  " + dimmed + "├" + safeRepeat("─", 76) + "┤" + reset + "\n"
 
 					// Show evaluation summary
 					evalInfo := fmt.Sprintf("Nodes Evaluated: %d  |  Nodes Filtered: %d  |  Nodes Exhausted: %d",
@@ -2689,7 +2905,7 @@ func (m model) View() string {
 
 					// Show constraint failures if any
 					if len(metrics.ConstraintFiltered) > 0 {
-						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Constraint Failures:" + reset + strings.Repeat(" ", 54) + dimmed + "│" + reset + "\n"
+						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Constraint Failures:" + reset + safeRepeat(" ", 54) + dimmed + "│" + reset + "\n"
 						for constraint, count := range metrics.ConstraintFiltered {
 							constraintLine := fmt.Sprintf("  • %s (%d nodes filtered)", truncate(constraint, 60), count)
 							content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", constraintLine) + dimmed + "│" + reset + "\n"
@@ -2698,7 +2914,7 @@ func (m model) View() string {
 
 					// Show dimension exhausted (resource shortages)
 					if len(metrics.DimensionExhausted) > 0 {
-						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Resource Exhaustion:" + reset + strings.Repeat(" ", 54) + dimmed + "│" + reset + "\n"
+						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Resource Exhaustion:" + reset + safeRepeat(" ", 54) + dimmed + "│" + reset + "\n"
 						for dimension, count := range metrics.DimensionExhausted {
 							dimLine := fmt.Sprintf("  • %s exhausted on %d nodes", dimension, count)
 							content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", dimLine) + dimmed + "│" + reset + "\n"
@@ -2707,7 +2923,7 @@ func (m model) View() string {
 
 					// Show class exhausted if any
 					if len(metrics.ClassExhausted) > 0 {
-						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Node Class Exhausted:" + reset + strings.Repeat(" ", 53) + dimmed + "│" + reset + "\n"
+						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Node Class Exhausted:" + reset + safeRepeat(" ", 53) + dimmed + "│" + reset + "\n"
 						for class, count := range metrics.ClassExhausted {
 							classLine := fmt.Sprintf("  • %s (%d nodes)", class, count)
 							content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", classLine) + dimmed + "│" + reset + "\n"
@@ -2716,7 +2932,7 @@ func (m model) View() string {
 
 					// Show quota exhausted if any
 					if len(metrics.QuotaExhausted) > 0 {
-						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Quota Exhausted:" + reset + strings.Repeat(" ", 58) + dimmed + "│" + reset + "\n"
+						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Quota Exhausted:" + reset + safeRepeat(" ", 58) + dimmed + "│" + reset + "\n"
 						for _, quota := range metrics.QuotaExhausted {
 							quotaLine := fmt.Sprintf("  • %s", quota)
 							content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", quotaLine) + dimmed + "│" + reset + "\n"
@@ -2729,15 +2945,17 @@ func (m model) View() string {
 						content += "  " + dimmed + "│" + reset + " " + dimmed + fmt.Sprintf("%-75s", coalescedLine) + reset + dimmed + "│" + reset + "\n"
 					}
 
-					content += "  " + dimmed + "╰" + strings.Repeat("─", 76) + "╯" + reset + "\n"
+					content += "  " + dimmed + "╰" + safeRepeat("─", 76) + "╯" + reset + "\n"
 				}
 			}
 
-			// Clean navigation bar - dynamic based on allocation selection mode
+			// Clean navigation bar - dynamic based on allocation/evaluation selection mode
 			if m.allocSelectMode {
-				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
+				content += "\n  " + m.theme.Running + "ALLOC MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "x" + reset + " Restart  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
+			} else if m.evalSelectMode {
+				content += "\n  " + m.theme.Pending + "EVAL MODE" + reset + "  " + dimmed + "│" + reset + "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Exit Mode\n"
 			} else {
-				content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "a" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "e" + reset + " Events  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+				content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "a" + reset + " Select Alloc  " + dimmed + "│" + reset + "  " + cyan + "e" + reset + " Select Eval  " + dimmed + "│" + reset + "  " + cyan + "n" + reset + "/" + cyan + "p" + reset + " Next/Prev  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
 			}
 		} else {
 			content = "\n  Invalid job selection. Press 'Esc' to go back.\n"
@@ -2759,7 +2977,7 @@ func (m model) View() string {
 		content += "\n"
 
 		// Log content section
-		content += "  " + dimmed + strings.Repeat("─", 60) + reset + "\n"
+		content += "  " + dimmed + safeRepeat("─", 60) + reset + "\n"
 
 		// Calculate available lines for logs
 		maxLogLines := m.height - 12
@@ -2816,9 +3034,9 @@ func (m model) View() string {
 			colType := eventsColWidths[3]
 			colMsg := eventsColWidths[4]
 
-			content += "  " + dimmed + "╭" + strings.Repeat("─", colTime) + "┬" + strings.Repeat("─", colAlloc) + "┬" + strings.Repeat("─", colTask) + "┬" + strings.Repeat("─", colType) + "┬" + strings.Repeat("─", colMsg) + "╮" + reset + "\n"
+			content += "  " + dimmed + "╭" + safeRepeat("─", colTime) + "┬" + safeRepeat("─", colAlloc) + "┬" + safeRepeat("─", colTask) + "┬" + safeRepeat("─", colType) + "┬" + safeRepeat("─", colMsg) + "╮" + reset + "\n"
 			content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAlloc-1, "Alloc") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTask-1, "Task") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colMsg-1, "Message") + reset + dimmed + "│" + reset + "\n"
-			content += "  " + dimmed + "├" + strings.Repeat("─", colTime) + "┼" + strings.Repeat("─", colAlloc) + "┼" + strings.Repeat("─", colTask) + "┼" + strings.Repeat("─", colType) + "┼" + strings.Repeat("─", colMsg) + "┤" + reset + "\n"
+			content += "  " + dimmed + "├" + safeRepeat("─", colTime) + "┼" + safeRepeat("─", colAlloc) + "┼" + safeRepeat("─", colTask) + "┼" + safeRepeat("─", colType) + "┼" + safeRepeat("─", colMsg) + "┤" + reset + "\n"
 
 			// Calculate max events to display
 			maxEvents := m.height - 14
@@ -2855,11 +3073,330 @@ func (m model) View() string {
 				content += "  " + dimmed + "│" + reset + timeField + dimmed + "│" + reset + allocField + dimmed + "│" + reset + taskField + dimmed + "│" + reset + typeField + dimmed + "│" + reset + msgField + dimmed + "│" + reset + "\n"
 			}
 
-			content += "  " + dimmed + "╰" + strings.Repeat("─", colTime) + "┴" + strings.Repeat("─", colAlloc) + "┴" + strings.Repeat("─", colTask) + "┴" + strings.Repeat("─", colType) + "┴" + strings.Repeat("─", colMsg) + "╯" + reset + "\n"
+			content += "  " + dimmed + "╰" + safeRepeat("─", colTime) + "┴" + safeRepeat("─", colAlloc) + "┴" + safeRepeat("─", colTask) + "┴" + safeRepeat("─", colType) + "┴" + safeRepeat("─", colMsg) + "╯" + reset + "\n"
 		}
 
 		// Navigation hint
 		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+
+	case "alloc-detail":
+		// Header
+		content = "\n" + renderHeader("📦 ALLOCATION DETAILS", boxWidth, m.theme.Header, bold, reset) + "\n"
+
+		if m.selectedAlloc == nil {
+			content += "  " + dimmed + "No allocation selected" + reset + "\n"
+		} else {
+			alloc := m.selectedAlloc
+
+			// Allocation ID and status
+			allocID := alloc.ID
+			if len(allocID) > 16 {
+				allocID = allocID[:16] + "..."
+			}
+			statusIcon := "●"
+			statusLabel := strings.ToUpper(alloc.ClientStatus)
+			statusColor := ansiColor(alloc.ClientStatus, m.theme)
+
+			content += "  " + bold + white + allocID + reset + "  "
+			content += statusColor + statusIcon + " " + statusLabel + reset + "\n"
+			content += "  " + dimmed + "Job: " + alloc.JobID + " · Task Group: " + alloc.TaskGroup + reset + "\n\n"
+
+			// Info cards
+			cardWidth := 38
+			gap := "  "
+
+			cardRow := func(label string, value string) string {
+				labelPadded := fmt.Sprintf("%-12s", label)
+				valuePadded := fmt.Sprintf("%-*s", cardWidth-15, truncate(value, cardWidth-15))
+				return "  " + dimmed + labelPadded + reset + " " + valuePadded
+			}
+
+			// Top border
+			content += "  " + dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + gap
+			content += dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + "\n"
+
+			// Card headers
+			content += "  " + dimmed + "│" + reset + " " + bold + cyan + "ALLOCATION INFO" + reset + safeRepeat(" ", cardWidth-16) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + " " + bold + cyan + "RESOURCES" + reset + safeRepeat(" ", cardWidth-10) + dimmed + "│" + reset + "\n"
+
+			// Separator
+			content += "  " + dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + gap
+			content += dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + "\n"
+
+			// Row 1: Node | CPU
+			nodeID := "N/A"
+			if alloc.NodeID != "" {
+				nodeID = alloc.NodeID[:8]
+			}
+			cpuMHz := 0
+			if alloc.Resources != nil && alloc.Resources.CPU != nil {
+				cpuMHz = *alloc.Resources.CPU
+			}
+			content += "  " + dimmed + "│" + reset + cardRow("Node", nodeID) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("CPU", fmt.Sprintf("%d MHz", cpuMHz)) + dimmed + "│" + reset + "\n"
+
+			// Row 2: Desired | Memory
+			memMB := 0
+			if alloc.Resources != nil && alloc.Resources.MemoryMB != nil {
+				memMB = *alloc.Resources.MemoryMB
+			}
+			content += "  " + dimmed + "│" + reset + cardRow("Desired", alloc.DesiredStatus) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("Memory", fmt.Sprintf("%d MB", memMB)) + dimmed + "│" + reset + "\n"
+
+			// Row 3: Created | Disk
+			created := time.Unix(0, alloc.CreateTime).Format("Jan 02 15:04:05")
+			diskMB := 0
+			if alloc.Resources != nil && alloc.Resources.DiskMB != nil {
+				diskMB = *alloc.Resources.DiskMB
+			}
+			content += "  " + dimmed + "│" + reset + cardRow("Created", created) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("Disk", fmt.Sprintf("%d MB", diskMB)) + dimmed + "│" + reset + "\n"
+
+			// Bottom border
+			content += "  " + dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + gap
+			content += dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + "\n\n"
+
+			// Task States
+			if len(alloc.TaskStates) > 0 {
+				content += "  " + bold + cyan + "TASK STATES" + reset + "\n"
+
+				// Calculate dynamic column widths for tasks table
+				taskTableWidth := getTableWidth(m.width, 4)
+				taskColWidths := calculateColumnWidths(taskTableWidth, []int{2, 2, 2, 3}, []int{12, 10, 12, 20})
+				colTaskName := taskColWidths[0]
+				colState := taskColWidths[1]
+				colStarted := taskColWidths[2]
+				colLastEvent := taskColWidths[3]
+
+				content += "  " + dimmed + "╭" + safeRepeat("─", colTaskName) + "┬" + safeRepeat("─", colState) + "┬" + safeRepeat("─", colStarted) + "┬" + safeRepeat("─", colLastEvent) + "╮" + reset + "\n"
+				content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTaskName-1, "Task") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colState-1, "State") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colStarted-1, "Started") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colLastEvent-1, "Last Event") + reset + dimmed + "│" + reset + "\n"
+				content += "  " + dimmed + "├" + safeRepeat("─", colTaskName) + "┼" + safeRepeat("─", colState) + "┼" + safeRepeat("─", colStarted) + "┼" + safeRepeat("─", colLastEvent) + "┤" + reset + "\n"
+
+				for taskName, taskState := range alloc.TaskStates {
+					state := taskState.State
+					stateColor := ""
+					switch state {
+					case "running":
+						stateColor = m.theme.Running
+					case "pending":
+						stateColor = m.theme.Pending
+					case "dead", "failed":
+						stateColor = m.theme.Dead
+					}
+
+					started := "N/A"
+					if !taskState.StartedAt.IsZero() {
+						started = taskState.StartedAt.Format("15:04:05")
+					}
+
+					lastEvent := ""
+					if len(taskState.Events) > 0 {
+						lastEvent = taskState.Events[len(taskState.Events)-1].Type
+					}
+
+					nameField := fmt.Sprintf(" %-*s", colTaskName-1, truncate(taskName, colTaskName-2))
+					stateField := fmt.Sprintf(" %-*s", colState-1, state)
+					startedField := fmt.Sprintf(" %-*s", colStarted-1, started)
+					eventField := fmt.Sprintf(" %-*s", colLastEvent-1, truncate(lastEvent, colLastEvent-2))
+
+					content += "  " + dimmed + "│" + reset + nameField + dimmed + "│" + reset + stateColor + stateField + reset + dimmed + "│" + reset + startedField + dimmed + "│" + reset + eventField + dimmed + "│" + reset + "\n"
+				}
+
+				content += "  " + dimmed + "╰" + safeRepeat("─", colTaskName) + "┴" + safeRepeat("─", colState) + "┴" + safeRepeat("─", colStarted) + "┴" + safeRepeat("─", colLastEvent) + "╯" + reset + "\n"
+			}
+		}
+
+		// Navigation hint
+		content += "\n  " + cyan + "e" + reset + " Events  " + dimmed + "│" + reset + "  " + cyan + "l" + reset + " Logs  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+
+	case "alloc-events":
+		// Header
+		content = "\n" + renderHeader("📋 ALLOCATION EVENTS", boxWidth, m.theme.Header, bold, reset) + "\n"
+
+		// Alloc info
+		if m.selectedAlloc != nil {
+			allocID := m.selectedAlloc.ID
+			if len(allocID) > 16 {
+				allocID = allocID[:16] + "..."
+			}
+			content += "  " + bold + allocID + reset + "\n"
+			content += "  " + dimmed + "Job: " + m.selectedAlloc.JobID + " · Task Group: " + m.selectedAlloc.TaskGroup + reset + "\n\n"
+		}
+
+		// Events section
+		content += "  " + bold + cyan + "RECENT EVENTS" + reset + "\n"
+
+		if len(m.eventsList) == 0 {
+			content += "  " + dimmed + "Loading events..." + reset + "\n"
+		} else {
+			// Calculate dynamic column widths for events table
+			eventsTableWidth := getTableWidth(m.width, 5)
+			eventsColWidths := calculateColumnWidths(eventsTableWidth, []int{3, 1, 2, 2, 4}, []int{16, 8, 10, 10, 16})
+			colTime := eventsColWidths[0]
+			colAlloc := eventsColWidths[1]
+			colTask := eventsColWidths[2]
+			colType := eventsColWidths[3]
+			colMsg := eventsColWidths[4]
+
+			content += "  " + dimmed + "╭" + safeRepeat("─", colTime) + "┬" + safeRepeat("─", colAlloc) + "┬" + safeRepeat("─", colTask) + "┬" + safeRepeat("─", colType) + "┬" + safeRepeat("─", colMsg) + "╮" + reset + "\n"
+			content += "  " + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTime-1, "Time") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colAlloc-1, "Alloc") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colTask-1, "Task") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colType-1, "Type") + reset + dimmed + "│" + reset + " " + bold + fmt.Sprintf("%-*s", colMsg-1, "Message") + reset + dimmed + "│" + reset + "\n"
+			content += "  " + dimmed + "├" + safeRepeat("─", colTime) + "┼" + safeRepeat("─", colAlloc) + "┼" + safeRepeat("─", colTask) + "┼" + safeRepeat("─", colType) + "┼" + safeRepeat("─", colMsg) + "┤" + reset + "\n"
+
+			maxEvents := m.height - 14
+			if maxEvents < 5 {
+				maxEvents = 5
+			}
+			if maxEvents > len(m.eventsList) {
+				maxEvents = len(m.eventsList)
+			}
+
+			for i := 0; i < maxEvents; i++ {
+				event := m.eventsList[i]
+
+				timeStr := event.Time.Format("Jan 02 15:04:05")
+				timeField := " " + fmt.Sprintf("%-*s", colTime-1, truncate(timeStr, colTime-2))
+
+				allocField := " " + fmt.Sprintf("%-*s", colAlloc-1, truncate(event.AllocID, colAlloc-2))
+				taskField := " " + fmt.Sprintf("%-*s", colTask-1, truncate(event.Task, colTask-2))
+
+				typeColor := ""
+				switch event.Type {
+				case "Started", "Task Setup":
+					typeColor = m.theme.Running
+				case "Terminated", "Killing", "Killed":
+					typeColor = m.theme.Dead
+				case "Received", "Pending":
+					typeColor = m.theme.Pending
+				}
+				typeField := " " + typeColor + fmt.Sprintf("%-*s", colType-1, truncate(event.Type, colType-2)) + reset
+
+				msgField := " " + fmt.Sprintf("%-*s", colMsg-1, truncate(event.Message, colMsg-2))
+
+				content += "  " + dimmed + "│" + reset + timeField + dimmed + "│" + reset + allocField + dimmed + "│" + reset + taskField + dimmed + "│" + reset + typeField + dimmed + "│" + reset + msgField + dimmed + "│" + reset + "\n"
+			}
+
+			content += "  " + dimmed + "╰" + safeRepeat("─", colTime) + "┴" + safeRepeat("─", colAlloc) + "┴" + safeRepeat("─", colTask) + "┴" + safeRepeat("─", colType) + "┴" + safeRepeat("─", colMsg) + "╯" + reset + "\n"
+		}
+
+		// Navigation hint
+		content += "\n  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back\n"
+
+	case "eval-detail":
+		// Header
+		content = "\n" + renderHeader("📊 EVALUATION DETAILS", boxWidth, m.theme.Header, bold, reset) + "\n"
+
+		if m.selectedEval == nil {
+			content += "  " + dimmed + "No evaluation selected" + reset + "\n"
+		} else {
+			eval := m.selectedEval
+
+			// Evaluation ID and status
+			evalID := eval.ID
+			if len(evalID) > 16 {
+				evalID = evalID[:16] + "..."
+			}
+			statusLabel := strings.ToUpper(eval.Status)
+			statusColor := ""
+			switch eval.Status {
+			case "complete":
+				statusColor = m.theme.Running
+			case "pending":
+				statusColor = m.theme.Pending
+			case "blocked", "failed", "canceled":
+				statusColor = m.theme.Dead
+			}
+
+			content += "  " + bold + white + evalID + reset + "  "
+			content += statusColor + "● " + statusLabel + reset + "\n"
+			content += "  " + dimmed + "Job: " + eval.JobID + reset + "\n\n"
+
+			// Info cards
+			cardWidth := 38
+			gap := "  "
+
+			cardRow := func(label string, value string) string {
+				labelPadded := fmt.Sprintf("%-14s", label)
+				valuePadded := fmt.Sprintf("%-*s", cardWidth-17, truncate(value, cardWidth-17))
+				return "  " + dimmed + labelPadded + reset + " " + valuePadded
+			}
+
+			// Top border
+			content += "  " + dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + gap
+			content += dimmed + "╭" + safeRepeat("─", cardWidth) + "╮" + reset + "\n"
+
+			// Card headers
+			content += "  " + dimmed + "│" + reset + " " + bold + cyan + "EVALUATION INFO" + reset + safeRepeat(" ", cardWidth-16) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + " " + bold + cyan + "PLACEMENT" + reset + safeRepeat(" ", cardWidth-10) + dimmed + "│" + reset + "\n"
+
+			// Separator
+			content += "  " + dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + gap
+			content += dimmed + "├" + safeRepeat("─", cardWidth) + "┤" + reset + "\n"
+
+			// Row 1: Triggered By | Status
+			placementStatus := "OK"
+			if eval.FailedTGAllocs != nil && len(eval.FailedTGAllocs) > 0 {
+				failedCount := 0
+				for _, metric := range eval.FailedTGAllocs {
+					failedCount += metric.CoalescedFailures + 1
+				}
+				placementStatus = fmt.Sprintf("Failed (%d)", failedCount)
+			} else if eval.Status == "blocked" {
+				placementStatus = "Blocked"
+			}
+			content += "  " + dimmed + "│" + reset + cardRow("Triggered By", eval.TriggeredBy) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("Status", placementStatus) + dimmed + "│" + reset + "\n"
+
+			// Row 2: Priority | Type
+			content += "  " + dimmed + "│" + reset + cardRow("Priority", fmt.Sprintf("%d", eval.Priority)) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("Type", eval.Type) + dimmed + "│" + reset + "\n"
+
+			// Row 3: Created | Wait Until
+			created := time.Unix(0, eval.CreateTime).Format("Jan 02 15:04:05")
+			waitUntil := "N/A"
+			if eval.WaitUntil.IsZero() == false {
+				waitUntil = eval.WaitUntil.Format("15:04:05")
+			}
+			content += "  " + dimmed + "│" + reset + cardRow("Created", created) + dimmed + "│" + reset + gap
+			content += dimmed + "│" + reset + cardRow("Wait Until", waitUntil) + dimmed + "│" + reset + "\n"
+
+			// Bottom border
+			content += "  " + dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + gap
+			content += dimmed + "╰" + safeRepeat("─", cardWidth) + "╯" + reset + "\n\n"
+
+			// Placement Failures
+			if eval.FailedTGAllocs != nil && len(eval.FailedTGAllocs) > 0 {
+				content += "  " + bold + m.theme.Dead + "⚠ PLACEMENT FAILURES" + reset + "\n"
+
+				for taskGroup, metrics := range eval.FailedTGAllocs {
+					content += "  " + dimmed + "╭" + safeRepeat("─", 76) + "╮" + reset + "\n"
+					content += "  " + dimmed + "│" + reset + " " + bold + "Task Group: " + reset + white + taskGroup + reset + safeRepeat(" ", 76-14-len(taskGroup)) + dimmed + "│" + reset + "\n"
+					content += "  " + dimmed + "├" + safeRepeat("─", 76) + "┤" + reset + "\n"
+
+					evalInfo := fmt.Sprintf("Nodes Evaluated: %d  |  Nodes Filtered: %d  |  Nodes Exhausted: %d",
+						metrics.NodesEvaluated, metrics.NodesFiltered, metrics.NodesExhausted)
+					content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", evalInfo) + dimmed + "│" + reset + "\n"
+
+					if len(metrics.ConstraintFiltered) > 0 {
+						content += "  " + dimmed + "│" + reset + " " + m.theme.Dead + "Constraint Failures:" + reset + safeRepeat(" ", 54) + dimmed + "│" + reset + "\n"
+						for constraint, count := range metrics.ConstraintFiltered {
+							constraintLine := fmt.Sprintf("  • %s (%d nodes)", truncate(constraint, 60), count)
+							content += "  " + dimmed + "│" + reset + " " + fmt.Sprintf("%-75s", constraintLine) + dimmed + "│" + reset + "\n"
+						}
+					}
+
+					if metrics.CoalescedFailures > 0 {
+						coalescedLine := fmt.Sprintf("(+%d additional failures)", metrics.CoalescedFailures)
+						content += "  " + dimmed + "│" + reset + " " + dimmed + fmt.Sprintf("%-75s", coalescedLine) + reset + dimmed + "│" + reset + "\n"
+					}
+
+					content += "  " + dimmed + "╰" + safeRepeat("─", 76) + "╯" + reset + "\n"
+				}
+			}
+		}
+
+		// Navigation hint
+		content += "\n  " + cyan + "Esc" + reset + " Back\n"
+
 	}
 	// Footer bar with grey background
 	plainFooter := "Press 'h' for help, 'q' for quit"
@@ -2872,8 +3409,8 @@ func (m model) View() string {
 	if rightPad < 0 {
 		rightPad = 0
 	}
-	footerLine := "\033[48;5;237m" + "\033[37m" + strings.Repeat(" ", leftPad) + "Press '\033[38;5;51mh\033[37m' for help, '\033[38;5;204mq\033[37m' for quit" + strings.Repeat(" ", rightPad) + "\033[0m"
-	content += "\n" + strings.Repeat("─", m.width) + "\n" + footerLine + "\n"
+	footerLine := "\033[48;5;237m" + "\033[37m" + safeRepeat(" ", leftPad) + "Press '\033[38;5;51mh\033[37m' for help, '\033[38;5;204mq\033[37m' for quit" + safeRepeat(" ", rightPad) + "\033[0m"
+	content += "\n" + safeRepeat("─", m.width) + "\n" + footerLine + "\n"
 	lines := strings.Split(strings.TrimSuffix(content, "\n"), "\n")
 
 	// Apply scrolling for scrollable views (job-status, node-status, cluster)
@@ -2952,24 +3489,24 @@ func (m model) View() string {
 		if leftPad < 0 {
 			leftPad = 0
 		}
-		padding := strings.Repeat(" ", leftPad)
+		padding := safeRepeat(" ", leftPad)
 
 		// Build dialog box
-		topBorder := padding + "╭" + strings.Repeat("─", dialogWidth-2) + "╮"
-		bottomBorder := padding + "╰" + strings.Repeat("─", dialogWidth-2) + "╯"
-		emptyLine := padding + "│" + strings.Repeat(" ", dialogWidth-2) + "│"
+		topBorder := padding + "╭" + safeRepeat("─", dialogWidth-2) + "╮"
+		bottomBorder := padding + "╰" + safeRepeat("─", dialogWidth-2) + "╯"
+		emptyLine := padding + "│" + safeRepeat(" ", dialogWidth-2) + "│"
 
 		// Center the message
 		msgPadLeft := (dialogWidth - 2 - len(message)) / 2
 		msgPadRight := dialogWidth - 2 - len(message) - msgPadLeft
-		messageLine := padding + "│" + strings.Repeat(" ", msgPadLeft) + bold + message + reset + strings.Repeat(" ", msgPadRight) + "│"
+		messageLine := padding + "│" + safeRepeat(" ", msgPadLeft) + bold + message + reset + safeRepeat(" ", msgPadRight) + "│"
 
 		// Options line
 		options := "[" + m.theme.Running + "y" + reset + "]es  /  [" + m.theme.Dead + "n" + reset + "]o"
 		optVisualLen := 12 // "y" + "es  /  " + "n" + "o" + brackets
 		optPadLeft := (dialogWidth - 2 - optVisualLen) / 2
 		optPadRight := dialogWidth - 2 - optVisualLen - optPadLeft
-		optionsLine := padding + "│" + strings.Repeat(" ", optPadLeft) + options + strings.Repeat(" ", optPadRight) + "│"
+		optionsLine := padding + "│" + safeRepeat(" ", optPadLeft) + options + safeRepeat(" ", optPadRight) + "│"
 
 		// Split main content into lines and overlay the dialog
 		contentLines := strings.Split(strings.TrimSuffix(mainContent, "\n"), "\n")

@@ -95,7 +95,6 @@ install_nomad_tui() {
     
     # Create temporary directory
     temp_dir=$(mktemp -d)
-    trap 'rm -rf "$temp_dir"' EXIT
     
     # Download archive
     echo ""
@@ -150,6 +149,9 @@ install_nomad_tui() {
     fi
     
     echo "Run '${BINARY_NAME} -h' to get started!"
+    
+    # Cleanup temporary directory
+    rm -rf "$temp_dir"
 }
 
 # Main
