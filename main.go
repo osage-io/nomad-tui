@@ -104,8 +104,11 @@ type model struct {
 	selectedEval         *api.Evaluation // currently selected evaluation for eval-detail view
 	previousView         string          // track previous view for back navigation
 	// Filter/search state
-	filterActive bool   // when true, show filter input overlay
-	filterInput  string // current filter text input
+	filterActive     bool   // when true, show filter input overlay
+	filterInput      string // current filter text input
+	filteredJobs     []*jobStats
+	filteredNodes    []*nodeStats
+	filteredServices []*serviceInfo
 	// Blocking query state
 	jobsIndex      uint64 // LastIndex for jobs blocking query
 	nodesIndex     uint64 // LastIndex for nodes blocking query
@@ -1145,6 +1148,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.filterActive = false
 				m.filterInput = ""
+				// Rebuild filtered lists
+				m.filteredJobs = m.buildFilteredJobs()
+				m.filteredNodes = m.buildFilteredNodes()
+				m.filteredServices = m.buildFilteredServices()
+				// Reset selection to 0 when clearing filter
+				if m.view == "jobs" {
+					m.selectedIndex = 0
+					m.jobsScrollOffset = 0
+				} else if m.view == "nodes" {
+					m.selectedNodeIndex = 0
+					m.nodesScrollOffset = 0
+				} else if m.view == "services" {
+					m.selectedServiceIndex = 0
+					m.servicesScrollOffset = 0
+				}
 				return m, nil
 			case "enter":
 				m.filterActive = false
@@ -1152,12 +1170,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "backspace":
 				if len(m.filterInput) > 0 {
 					m.filterInput = m.filterInput[:len(m.filterInput)-1]
+					// Rebuild filtered lists
+					m.filteredJobs = m.buildFilteredJobs()
+					m.filteredNodes = m.buildFilteredNodes()
+					m.filteredServices = m.buildFilteredServices()
+					// Reset selection if it's out of bounds
+					if m.view == "jobs" && m.selectedIndex >= len(m.filteredJobs) {
+						m.selectedIndex = 0
+						m.jobsScrollOffset = 0
+					} else if m.view == "nodes" && m.selectedNodeIndex >= len(m.filteredNodes) {
+						m.selectedNodeIndex = 0
+						m.nodesScrollOffset = 0
+					} else if m.view == "services" && m.selectedServiceIndex >= len(m.filteredServices) {
+						m.selectedServiceIndex = 0
+						m.servicesScrollOffset = 0
+					}
 				}
 				return m, nil
 			default:
 				// Add printable characters to filter input
 				if len(key) == 1 && key >= " " && key <= "~" {
 					m.filterInput += key
+					// Rebuild filtered lists
+					m.filteredJobs = m.buildFilteredJobs()
+					m.filteredNodes = m.buildFilteredNodes()
+					m.filteredServices = m.buildFilteredServices()
+					// Reset selection if it's out of bounds
+					if m.view == "jobs" && m.selectedIndex >= len(m.filteredJobs) {
+						m.selectedIndex = 0
+						m.jobsScrollOffset = 0
+					} else if m.view == "nodes" && m.selectedNodeIndex >= len(m.filteredNodes) {
+						m.selectedNodeIndex = 0
+						m.nodesScrollOffset = 0
+					} else if m.view == "services" && m.selectedServiceIndex >= len(m.filteredServices) {
+						m.selectedServiceIndex = 0
+						m.servicesScrollOffset = 0
+					}
 				}
 				return m, nil
 			}
@@ -1324,52 +1372,70 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollOffset--
 			}
 		case "down":
-			if m.view == "jobs" && m.selectedIndex < len(m.jobs)-1 {
-				m.selectedIndex++
-				// Calculate max visible jobs (same formula as in View)
-				// Chrome = 15 lines (10 before table + 5 after)
-				if m.height > 0 {
-					chromeLines := 15
-					maxVisibleJobs := m.height - chromeLines
-					if maxVisibleJobs < 1 {
-						maxVisibleJobs = 1
-					}
-					// Scroll down if selection is within 2 lines of bottom of visible area
-					scrollBuffer := 2
-					if m.selectedIndex >= m.jobsScrollOffset+maxVisibleJobs-scrollBuffer {
-						m.jobsScrollOffset = m.selectedIndex - maxVisibleJobs + scrollBuffer + 1
+			if m.view == "jobs" {
+				maxJobs := len(m.filteredJobs)
+				if maxJobs == 0 {
+					maxJobs = len(m.jobs)
+				}
+				if m.selectedIndex < maxJobs-1 {
+					m.selectedIndex++
+					// Calculate max visible jobs (same formula as in View)
+					// Chrome = 15 lines (10 before table + 5 after)
+					if m.height > 0 {
+						chromeLines := 15
+						maxVisibleJobs := m.height - chromeLines
+						if maxVisibleJobs < 1 {
+							maxVisibleJobs = 1
+						}
+						// Scroll down if selection is within 2 lines of bottom of visible area
+						scrollBuffer := 2
+						if m.selectedIndex >= m.jobsScrollOffset+maxVisibleJobs-scrollBuffer {
+							m.jobsScrollOffset = m.selectedIndex - maxVisibleJobs + scrollBuffer + 1
+						}
 					}
 				}
 			}
-			if m.view == "nodes" && m.selectedNodeIndex < len(m.nodes)-1 {
-				m.selectedNodeIndex++
-				// Calculate max visible nodes (same chrome as jobs = 15 lines)
-				if m.height > 0 {
-					chromeLines := 15
-					maxVisibleNodes := m.height - chromeLines
-					if maxVisibleNodes < 1 {
-						maxVisibleNodes = 1
-					}
-					// Scroll down if selection is within 2 lines of bottom of visible area
-					scrollBuffer := 2
-					if m.selectedNodeIndex >= m.nodesScrollOffset+maxVisibleNodes-scrollBuffer {
-						m.nodesScrollOffset = m.selectedNodeIndex - maxVisibleNodes + scrollBuffer + 1
+			if m.view == "nodes" {
+				maxNodes := len(m.filteredNodes)
+				if maxNodes == 0 {
+					maxNodes = len(m.nodes)
+				}
+				if m.selectedNodeIndex < maxNodes-1 {
+					m.selectedNodeIndex++
+					// Calculate max visible nodes (same chrome as jobs = 15 lines)
+					if m.height > 0 {
+						chromeLines := 15
+						maxVisibleNodes := m.height - chromeLines
+						if maxVisibleNodes < 1 {
+							maxVisibleNodes = 1
+						}
+						// Scroll down if selection is within 2 lines of bottom of visible area
+						scrollBuffer := 2
+						if m.selectedNodeIndex >= m.nodesScrollOffset+maxVisibleNodes-scrollBuffer {
+							m.nodesScrollOffset = m.selectedNodeIndex - maxVisibleNodes + scrollBuffer + 1
+						}
 					}
 				}
 			}
-			if m.view == "services" && m.selectedServiceIndex < len(m.services)-1 {
-				m.selectedServiceIndex++
-				// Calculate max visible services (same chrome as jobs = 15 lines)
-				if m.height > 0 {
-					chromeLines := 15
-					maxVisibleServices := m.height - chromeLines
-					if maxVisibleServices < 1 {
-						maxVisibleServices = 1
-					}
-					// Scroll down if selection is within 2 lines of bottom of visible area
-					scrollBuffer := 2
-					if m.selectedServiceIndex >= m.servicesScrollOffset+maxVisibleServices-scrollBuffer {
-						m.servicesScrollOffset = m.selectedServiceIndex - maxVisibleServices + scrollBuffer + 1
+			if m.view == "services" {
+				maxServices := len(m.filteredServices)
+				if maxServices == 0 {
+					maxServices = len(m.services)
+				}
+				if m.selectedServiceIndex < maxServices-1 {
+					m.selectedServiceIndex++
+					// Calculate max visible services (same chrome as jobs = 15 lines)
+					if m.height > 0 {
+						chromeLines := 15
+						maxVisibleServices := m.height - chromeLines
+						if maxVisibleServices < 1 {
+							maxVisibleServices = 1
+						}
+						// Scroll down if selection is within 2 lines of bottom of visible area
+						scrollBuffer := 2
+						if m.selectedServiceIndex >= m.servicesScrollOffset+maxVisibleServices-scrollBuffer {
+							m.servicesScrollOffset = m.selectedServiceIndex - maxVisibleServices + scrollBuffer + 1
+						}
 					}
 				}
 			}
@@ -1401,9 +1467,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollOffset++
 			}
 		case "s":
-			if m.view == "jobs" && len(m.jobs) > 0 && m.confirmAction == "" {
-				m.confirmAction = "stop"
-				m.confirmJob = m.jobs[m.selectedIndex]
+			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
+				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
+				if originalIndex >= 0 && originalIndex < len(m.jobs) {
+					m.confirmAction = "stop"
+					m.confirmJob = m.jobs[originalIndex]
+				}
 			} else if m.view == "job-status" && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) && m.confirmAction == "" {
 				selectedJob := m.jobs[m.selectedJobIndex]
 				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
@@ -1420,26 +1489,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "d":
-			if m.view == "jobs" && len(m.jobs) > 0 && m.confirmAction == "" {
-				m.confirmAction = "delete"
-				m.confirmJob = m.jobs[m.selectedIndex]
+			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
+				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
+				if originalIndex >= 0 && originalIndex < len(m.jobs) {
+					m.confirmAction = "delete"
+					m.confirmJob = m.jobs[originalIndex]
+				}
 			}
 		case "i":
 			if m.view == "jobs" {
+				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
 				m.view = "job-status"
-				m.selectedJobIndex = m.selectedIndex
+				m.selectedJobIndex = originalIndex
 				m.selectedAllocIndex = 0
 				m.scrollOffset = 0
 			}
 		case "enter":
 			if m.view == "jobs" {
+				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
 				m.view = "job-status"
-				m.selectedJobIndex = m.selectedIndex
+				m.selectedJobIndex = originalIndex
 				m.selectedAllocIndex = 0
 				m.selectedEvalIndex = 0
 				m.scrollOffset = 0
 			}
 			if m.view == "nodes" {
+				m.selectedNodeIndex = m.getOriginalNodeIndex(m.selectedNodeIndex)
 				m.view = "node-status"
 				m.scrollOffset = 0
 			}
@@ -1561,6 +1636,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == "jobs" || m.view == "nodes" || m.view == "services" || m.view == "job-status" {
 				m.filterActive = true
 				m.filterInput = ""
+				// Initialize filtered lists
+				m.filteredJobs = m.buildFilteredJobs()
+				m.filteredNodes = m.buildFilteredNodes()
+				m.filteredServices = m.buildFilteredServices()
 			}
 		}
 	case dataMsg:
@@ -1572,10 +1651,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.totalCapacityCPU = msg.totalCapacityCPU
 		m.totalCapacityMem = msg.totalCapacityMem
 		m.totalReservedCPU = msg.totalReservedCPU
-		m.totalUsedCPU = msg.totalUsedCPU
 		m.totalReservedMem = msg.totalReservedMem
+		m.totalUsedCPU = msg.totalUsedCPU
 		m.totalUsedMem = msg.totalUsedMem
-		// Store blocking query indices
+
+		// Rebuild filtered lists when data changes
+		m.filteredJobs = m.buildFilteredJobs()
+		m.filteredNodes = m.buildFilteredNodes()
+		m.filteredServices = m.buildFilteredServices()
+
+		// Update blocking query indices
 		m.jobsIndex = msg.jobsIndex
 		m.nodesIndex = msg.nodesIndex
 		m.servicesIndex = msg.servicesIndex
@@ -1673,6 +1758,90 @@ func matchesFilter(text string, filter string) bool {
 		return true
 	}
 	return strings.Contains(strings.ToLower(text), strings.ToLower(filter))
+}
+
+// buildFilteredJobs returns filtered job list based on current filter
+func (m *model) buildFilteredJobs() []*jobStats {
+	if m.filterInput == "" {
+		return m.jobs
+	}
+	filtered := make([]*jobStats, 0)
+	for _, job := range m.jobs {
+		if matchesFilter(job.Name, m.filterInput) {
+			filtered = append(filtered, job)
+		}
+	}
+	return filtered
+}
+
+// buildFilteredNodes returns filtered node list based on current filter
+func (m *model) buildFilteredNodes() []*nodeStats {
+	if m.filterInput == "" {
+		return m.nodes
+	}
+	filtered := make([]*nodeStats, 0)
+	for _, node := range m.nodes {
+		if matchesFilter(node.Name, m.filterInput) || matchesFilter(node.ID, m.filterInput) {
+			filtered = append(filtered, node)
+		}
+	}
+	return filtered
+}
+
+// buildFilteredServices returns filtered service list based on current filter
+func (m *model) buildFilteredServices() []*serviceInfo {
+	if m.filterInput == "" {
+		return m.services
+	}
+	filtered := make([]*serviceInfo, 0)
+	for _, svc := range m.services {
+		if matchesFilter(svc.Name, m.filterInput) {
+			filtered = append(filtered, svc)
+		}
+	}
+	return filtered
+}
+
+// getOriginalJobIndex maps filtered index to original job list index
+func (m *model) getOriginalJobIndex(filteredIndex int) int {
+	if m.filterInput == "" || filteredIndex < 0 || filteredIndex >= len(m.filteredJobs) {
+		return filteredIndex
+	}
+	targetJob := m.filteredJobs[filteredIndex]
+	for i, job := range m.jobs {
+		if job == targetJob {
+			return i
+		}
+	}
+	return filteredIndex
+}
+
+// getOriginalNodeIndex maps filtered index to original node list index
+func (m *model) getOriginalNodeIndex(filteredIndex int) int {
+	if m.filterInput == "" || filteredIndex < 0 || filteredIndex >= len(m.filteredNodes) {
+		return filteredIndex
+	}
+	targetNode := m.filteredNodes[filteredIndex]
+	for i, node := range m.nodes {
+		if node == targetNode {
+			return i
+		}
+	}
+	return filteredIndex
+}
+
+// getOriginalServiceIndex maps filtered index to original service list index
+func (m *model) getOriginalServiceIndex(filteredIndex int) int {
+	if m.filterInput == "" || filteredIndex < 0 || filteredIndex >= len(m.filteredServices) {
+		return filteredIndex
+	}
+	targetService := m.filteredServices[filteredIndex]
+	for i, svc := range m.services {
+		if svc == targetService {
+			return i
+		}
+	}
+	return filteredIndex
 }
 
 // highlightMatch highlights the filter match in the text with color
