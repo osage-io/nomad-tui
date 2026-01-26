@@ -98,6 +98,7 @@ type model struct {
 	nodesScrollOffset    int             // scroll offset for nodes list view
 	servicesScrollOffset int             // scroll offset for services list view
 	logsScrollOffset     int             // scroll offset for logs view
+	logsFollowMode       bool            // when true, auto-scroll to bottom on log updates
 	allocSelectMode      bool            // when true, ↑/↓ navigates allocations instead of scrolling in job-status view
 	evalSelectMode       bool            // when true, ↑/↓ navigates evaluations instead of scrolling in job-status view
 	selectedEvalIndex    int             // index of selected evaluation in job-status view
@@ -1071,6 +1072,8 @@ type errMsg error
 
 type refreshMsg struct{}
 
+type logsRefreshMsg struct{}
+
 func (m model) Init() tea.Cmd {
 	// Initial load: fetch data immediately, then start with a heartbeat tick
 	// Blocking queries will be started after first data load
@@ -1218,6 +1221,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.view == "job-logs" && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
 				selectedJob := m.jobs[m.selectedJobIndex]
 				m.logContent = "Loading logs..."
+				// Use the selected allocation if one is selected and valid
+				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
+					selectedAlloc := selectedJob.allocs[m.selectedAllocIndex]
+					return m, fetchAllocLogs(m.client, selectedAlloc, selectedJob.Name)
+				}
+				// Fall back to finding any running allocation
 				return m, fetchLogs(m.client, selectedJob)
 			}
 			if m.view == "job-events" && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
@@ -1251,7 +1260,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.view = "nodes"
 			}
 		case "p":
-			if m.view == "job-status" {
+			if m.view == "job-logs" {
+				// Toggle pause/follow mode in logs view
+				m.logsFollowMode = !m.logsFollowMode
+				if m.logsFollowMode {
+					// When enabling follow mode, jump to bottom
+					m.logsScrollOffset = 999999
+				}
+			} else if m.view == "job-status" {
 				// Previous job
 				if m.selectedJobIndex > 0 {
 					m.selectedJobIndex--
@@ -1374,6 +1390,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.view == "job-logs" && m.logsScrollOffset > 0 {
 				m.logsScrollOffset--
+				// Disable follow mode when manually scrolling
+				m.logsFollowMode = false
 			}
 		case "down":
 			if m.view == "jobs" {
@@ -1472,6 +1490,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.view == "job-logs" {
 				m.logsScrollOffset++
+				// Disable follow mode when manually scrolling
+				m.logsFollowMode = false
 			}
 		case "s":
 			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
@@ -1554,7 +1574,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logJobName = selectedJob.Name
 				m.previousView = m.view
 				m.view = "job-logs"
-				m.logsScrollOffset = 0 // Reset scroll when opening logs
+				m.logsScrollOffset = 0  // Reset scroll when opening logs
+				m.logsFollowMode = true // Enable follow mode by default
 				// Use the selected allocation if one is selected and valid
 				if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
 					selectedAlloc := selectedJob.allocs[m.selectedAllocIndex]
@@ -1569,7 +1590,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.logJobName = m.selectedAlloc.JobID
 				m.previousView = m.view
 				m.view = "job-logs"
-				m.logsScrollOffset = 0 // Reset scroll when opening logs
+				m.logsScrollOffset = 0  // Reset scroll when opening logs
+				m.logsFollowMode = true // Enable follow mode by default
 				// Convert Allocation to AllocationListStub for fetchAllocLogs
 				allocStub := &api.AllocationListStub{
 					ID:           m.selectedAlloc.ID,
@@ -1654,6 +1676,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Jump to top of logs
 			if m.view == "job-logs" {
 				m.logsScrollOffset = 0
+				// Disable follow mode when manually scrolling
+				m.logsFollowMode = false
 			}
 		case "end":
 			// Jump to bottom of logs
@@ -1672,6 +1696,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.logsScrollOffset < 0 {
 					m.logsScrollOffset = 0
 				}
+				// Disable follow mode when manually scrolling
+				m.logsFollowMode = false
 			}
 		case "pgdn":
 			// Page down in logs
@@ -1780,8 +1806,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.logContent = msg.content
 			m.logAllocID = msg.allocID
 			m.logTaskName = msg.taskName
-			// Auto-scroll to bottom when new logs are loaded
-			m.logsScrollOffset = 999999 // Will be clamped to max in View
+			// Auto-scroll to bottom when new logs are loaded AND follow mode is enabled
+			if m.logsFollowMode {
+				m.logsScrollOffset = 999999 // Will be clamped to max in View
+			}
+		}
+		// If in follow mode and still viewing logs, schedule next refresh
+		if m.logsFollowMode && m.view == "job-logs" {
+			return m, tea.Tick(3*time.Second, func(t time.Time) tea.Msg { return logsRefreshMsg{} })
+		}
+		return m, nil
+	case logsRefreshMsg:
+		// Auto-refresh logs when in follow mode
+		if m.logsFollowMode && m.view == "job-logs" && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) {
+			selectedJob := m.jobs[m.selectedJobIndex]
+			// Use the selected allocation if one is selected and valid
+			if m.selectedAllocIndex >= 0 && m.selectedAllocIndex < len(selectedJob.allocs) {
+				selectedAlloc := selectedJob.allocs[m.selectedAllocIndex]
+				return m, fetchAllocLogs(m.client, selectedAlloc, selectedJob.Name)
+			}
+			// Fall back to finding any running allocation
+			return m, fetchLogs(m.client, selectedJob)
 		}
 		return m, nil
 	case eventsMsg:
@@ -3484,12 +3529,16 @@ func (m model) View() string {
 
 		// Scroll indicator
 		scrollIndicator := ""
+		followIndicator := ""
+		if m.logsFollowMode {
+			followIndicator = fmt.Sprintf("  %s[FOLLOW]%s", m.theme.Running, reset)
+		}
 		if totalLines > maxLogLines {
 			scrollIndicator = fmt.Sprintf("  %s(lines %d-%d of %d)%s", dimmed, startLine+1, endLine, totalLines, reset)
 		}
 
 		// Navigation hint
-		content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "Home" + reset + " Top  " + dimmed + "│" + reset + "  " + cyan + "End" + reset + " Bottom  " + dimmed + "│" + reset + "  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back" + scrollIndicator + "\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Scroll  " + dimmed + "│" + reset + "  " + cyan + "Home" + reset + " Top  " + dimmed + "│" + reset + "  " + cyan + "End" + reset + " Bottom  " + dimmed + "│" + reset + "  " + cyan + "p" + reset + " Pause/Follow  " + dimmed + "│" + reset + "  " + cyan + "r" + reset + " Refresh  " + dimmed + "│" + reset + "  " + cyan + "Esc" + reset + " Back" + followIndicator + scrollIndicator + "\n"
 
 	case "job-events":
 		// Header
