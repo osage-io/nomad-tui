@@ -1304,9 +1304,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.allocSelectMode {
 					// Exit allocation selection mode first
 					m.allocSelectMode = false
+					m.filterActive = false
+					m.filterInput = ""
 				} else if m.evalSelectMode {
 					// Exit evaluation selection mode first
 					m.evalSelectMode = false
+					m.filterActive = false
+					m.filterInput = ""
 				} else {
 					m.view = "jobs"
 				}
@@ -1608,8 +1612,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(selectedJob.evaluations) > 0 {
 					m.evalSelectMode = !m.evalSelectMode
 					m.allocSelectMode = false // Exit alloc mode if in it
+					// Clear filter when entering or exiting eval select mode
+					m.filterActive = false
+					m.filterInput = ""
 					if m.evalSelectMode {
-						// Entering eval select mode, ensure valid selection
+						// Ensure valid selection
 						if m.selectedEvalIndex < 0 || m.selectedEvalIndex >= len(selectedJob.evaluations) {
 							m.selectedEvalIndex = 0
 						}
@@ -1631,8 +1638,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if len(selectedJob.allocs) > 0 {
 					m.allocSelectMode = !m.allocSelectMode
 					m.evalSelectMode = false // Exit eval mode if in it
+					// Clear filter when entering or exiting alloc select mode
+					m.filterActive = false
+					m.filterInput = ""
 					if m.allocSelectMode {
-						// Entering alloc select mode, ensure valid selection
+						// Ensure valid selection
 						if m.selectedAllocIndex < 0 || m.selectedAllocIndex >= len(selectedJob.allocs) {
 							m.selectedAllocIndex = 0
 						}
