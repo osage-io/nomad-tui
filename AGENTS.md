@@ -59,45 +59,176 @@ find . -name "*.yaml" -o -name "*.yml" -exec yamllint {} \;
 - Test file naming: `test_<feature>.bats`
 - Run single test: `bats tests/test_nomad_install.bats`
 
-## Nomad Top Tool
+## Nomad TUI
 
-The `nomad-tui` is a terminal user interface (TUI) for monitoring and managing Nomad clusters, built with Go and Bubbletea.
+The `nomad-tui` is a comprehensive terminal user interface (TUI) for monitoring and managing Nomad clusters, built with Go and Bubbletea.
 
 ### Features
-- View Nomad jobs, nodes, and cluster overview
-- Jobs sorted with running jobs displayed first
-- Job selection with arrow keys for navigation
-- Stop and delete selected jobs
-- Display dynamically limited to terminal height, with headers always visible
-- Support for connecting to different Nomad servers via `-addr` flag
-- TLS certificate verification skip with `-skip-verify` flag
-- ACL token authentication with `-token` flag
-- Color-coded status indicators (green for running, yellow for pending, red for failed)
-- Bold job names and headers
-- Interactive help screen with colorized instructions
-- Support for color themes via `-theme` flag (default, dracula)
+
+#### Core Views
+- **Jobs View**: Browse all jobs with filtering, multi-selection, and job details
+- **Nodes View**: View all client nodes with status and resource utilization
+- **Services View**: Monitor Nomad native service registrations
+- **Cluster View**: High-level cluster metrics and resource utilization
+- **Job Details**: Comprehensive job information with allocation management
+- **Node Details**: Detailed node information with resource allocation
+- **Allocation Details**: Deep dive into individual allocation state and resources
+- **Evaluation Details**: View evaluation status and placement decisions
+- **Log Viewer**: Real-time log streaming for jobs and allocations (stdout/stderr)
+- **Events Viewer**: Monitor task events and state changes
+
+#### Job Management
+- Start, stop, and delete jobs (single or multi-select)
+- View job status, allocations, and evaluations
+- Navigate between jobs with n/p keys
+- Placement failure warnings and diagnostics
+- Job filtering by name
+
+#### Allocation Management
+- Stop and restart individual allocations
+- View allocation logs in real-time
+- View allocation events and state transitions
+- Navigate allocations within job details
+- CPU and memory usage tracking per allocation
+
+#### Node Management
+- View node status, capacity, and availability
+- Monitor resource utilization (CPU, memory)
+- View node-level details (drivers, host volumes, datacenter, node pool)
+- Navigate between nodes with n/p keys
+
+#### Service Discovery
+- View all Nomad native service registrations
+- Service name, tags, address, port, and associated job
+- Filter services by name
+
+#### Advanced Features
+- **Multi-selection**: Select multiple jobs with Shift+↑/↓ for bulk operations
+- **Filtering**: Press `/` or `f` to filter jobs, nodes, or services by name
+- **Blocking Queries**: Automatic real-time updates when cluster state changes (using Nomad blocking queries)
+- **Responsive Tables**: Column widths adjust proportionally to terminal size
+- **Smart Scrolling**: List and page-level scrolling with visual indicators
+- **Follow Mode**: Auto-scroll to bottom of logs (toggle with `p`)
+- **Color Themes**: 8 HashiCorp product themes (nomad, vault, consul, boundary, packer, terraform, waypoint, vagrant)
+- **TLS Support**: Full TLS certificate verification with skip option for dev
+- **ACL Authentication**: Token-based authentication support
+- **Environment Variables**: Configure via NOMAD_ADDR, NOMAD_TOKEN, NOMAD_SKIP_VERIFY
+
+#### Navigation
+- Arrow key navigation (←/→ for view switching, ↑/↓ for selection)
+- Vim-style navigation (j for jobs, n for nodes, c for cluster, v for services)
+- Enter key to drill down into details
+- Esc key to navigate back
+- Home/End for jumping to first/last items
+- PgUp/PgDown for fast scrolling
 
 ### Building and Running
 ```bash
+# Build the binary
 go build -o nomad-tui .
-./nomad-tui [-addr <server>] [-token <token>] [-skip-verify] [-theme <theme>]
+
+# Run with default settings (localhost:4646)
+./nomad-tui
+
+# Run with custom Nomad server
+./nomad-tui -addr https://nomad.example.com:4646
+
+# Run with ACL token
+./nomad-tui -addr https://nomad.example.com:4646 -token YOUR_TOKEN
+
+# Run with TLS verification skip (dev only)
+./nomad-tui -skip-verify
+
+# Run with a specific theme
+./nomad-tui -theme vault
 ```
 
-### Controls
-- `q`: Quit the application
-- `r`: Refresh data
-- `j`: Switch to jobs view
-- `n`: Switch to nodes view
-- `c`: Switch to cluster view
-- `↑/↓`: Select job (in jobs view)
-- `s`: Stop selected job
-- `d`: Delete selected job
+### Command-Line Flags
+- `-addr`: Nomad server address (default: http://localhost:4646 or $NOMAD_ADDR)
+- `-token`: Nomad ACL token (default: $NOMAD_TOKEN)
+- `-skip-verify`: Skip TLS certificate verification (default: false)
+- `-theme`: Color theme - nomad, vault, consul, boundary, packer, terraform, waypoint, vagrant (default: nomad)
+
+### Keyboard Controls
+
+#### Global
+- `q` or `Ctrl+C`: Quit the application
+- `r`: Refresh data manually
 - `h`: Toggle help screen
+- `←`/`→`: Switch between main views (Jobs → Nodes → Services → Cluster)
+- `/` or `f`: Activate filter mode
+
+#### View Switching
+- `j`: Switch to jobs view
+- `n`: Switch to nodes view (or next job/node in detail views)
+- `v`: Switch to services view
+- `c`: Switch to cluster view
+- `p`: Previous job/node in detail views, or toggle pause/follow in logs view
+- `b`: Back to previous view (from logs/events)
+- `Esc`: Back to parent view
+
+#### Jobs View
+- `↑`/`↓`: Navigate job list
+- `Shift+↑`/`Shift+↓`: Multi-select jobs
+- `Enter` or `i`: View job details
+- `s`: Stop selected job (single only)
+- `d`: Delete selected job(s) (supports multi-select)
+
+#### Job Details View
+- `↑`/`↓`: Scroll content
+- `a`: Enter allocation selection mode
+- `e`: View job events
+- `l`: View job logs
+- `n`/`p`: Next/Previous job
+- `Esc`: Back to jobs list
+
+#### Allocation Selection Mode (in Job Details)
+- `↑`/`↓`: Navigate allocations
+- `Enter`: View allocation details
+- `s`: Stop selected allocation
+- `x`: Restart selected allocation
+- `l`: View allocation logs
+- `Esc`: Exit allocation mode
+
+#### Nodes View
+- `↑`/`↓`: Navigate node list
+- `Enter`: View node details
+
+#### Node Details View
+- `↑`/`↓`: Scroll content
+- `n`/`p`: Next/Previous node
+- `Esc`: Back to nodes list
+
+#### Services View
+- `↑`/`↓`: Navigate service list
+
+#### Cluster View
+- `↑`/`↓`: Scroll content
+
+#### Logs View
+- `↑`/`↓`: Scroll log content
+- `p`: Toggle pause/follow mode
+- `r`: Refresh logs
+- `b` or `Esc`: Back to previous view
+- `Home`/`End`: Jump to top/bottom
+- `PgUp`/`PgDn`: Fast scroll
+
+#### Help View
+- `↑`/`↓`: Scroll help content
+- `h` or `Esc`: Close help
+
+#### Filter Mode
+- Type to filter items by name
+- `Backspace`: Delete characters
+- `Enter`: Accept filter and exit filter mode
+- `Esc`: Cancel filter and clear
 
 ### Terminal Compatibility
 - Uses alternate screen mode for full terminal utilization
-- Headers positioned on line 2 to ensure visibility in terminals with title bars
-- Responsive to window resizing, truncating content to fit height
+- Headers positioned properly to ensure visibility in all terminals
+- Responsive to window resizing, adapting content to fit height and width
+- Supports Unicode and ANSI color codes (256-color terminals recommended)
+- Minimum recommended terminal size: 80x24
 
 ## Code Style Guidelines
 
