@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -1179,6 +1180,13 @@ func formatAllocStatuses(statuses map[string]int) string {
 		parts = append(parts, fmt.Sprintf("%s:%d", status, count))
 	}
 	return " [" + strings.Join(parts, ", ") + "]"
+}
+
+// stripAnsi removes ANSI escape codes from a string for length calculation
+func stripAnsi(s string) string {
+	// Remove ANSI escape sequences
+	ansiPattern := regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	return ansiPattern.ReplaceAllString(s, "")
 }
 
 // displayWidth calculates the visual width of a string in the terminal
@@ -2653,6 +2661,52 @@ func (m model) View() string {
 			scrollIndicator = fmt.Sprintf("  %s(%d-%d of %d)%s", dimmed, m.jobsScrollOffset+1, endIndex, len(filteredJobs), reset)
 		}
 
+		// Selected job info footer (above navigation)
+		if m.selectedIndex >= 0 && m.selectedIndex < len(filteredJobs) {
+			selectedJob := filteredJobs[m.selectedIndex]
+			if selectedJob != nil {
+				var jobInfo string
+				if selectedJob.Status == "running" && len(selectedJob.allocs) > 0 {
+					// Show CPU/Memory for running jobs with visual indicators
+					cpuStr := fmt.Sprintf("%.0f MHz", selectedJob.avgCPU)
+					memStr := fmt.Sprintf("%.0f MB", selectedJob.avgMem)
+					allocCount := len(selectedJob.allocs)
+					jobInfo = fmt.Sprintf("%s%s%s  │  %s%s⚡%s%s CPU:%s %s%s%s  │  %s%s▣%s%s Memory:%s %s%s%s  │  %s%s■%s%s Allocations:%s %s%d%s",
+						bold, selectedJob.Name, reset,
+						dimmed, m.theme.Running, reset, dimmed, reset, m.theme.Running, cpuStr, reset,
+						dimmed, cyan, reset, dimmed, reset, cyan, memStr, reset,
+						dimmed, m.theme.Running, reset, dimmed, reset, bold, allocCount, reset)
+				} else {
+					// Show allocation status breakdown for dead/batch jobs
+					statusInfo := ""
+					for status, count := range selectedJob.allocStatuses {
+						if statusInfo != "" {
+							statusInfo += "  │  "
+						}
+						statusColor := ansiColor(status, m.theme)
+						statusInfo += fmt.Sprintf("%s: %s%d%s", status, statusColor, count, reset)
+					}
+					if statusInfo == "" {
+						statusInfo = dimmed + "No allocations" + reset
+					}
+					jobInfo = fmt.Sprintf("%s%s%s  │  Type: %s  │  %s",
+						bold, selectedJob.Name, reset,
+						selectedJob.Type,
+						statusInfo)
+				}
+				// Center the job info
+				jobInfoLen := len(stripAnsi(jobInfo))
+				padding := ""
+				if m.width > jobInfoLen {
+					leftPad := (m.width - jobInfoLen) / 2
+					padding = strings.Repeat(" ", leftPad)
+				}
+				content += "\n"
+				content += padding + jobInfo + "\n"
+				content += "  " + dimmed + strings.Repeat("─", m.width-4) + reset + "\n\n"
+			}
+		}
+
 		// Navigation hint with filter indicator
 		filterHint := ""
 		if m.filterInput != "" {
@@ -2660,7 +2714,7 @@ func (m model) View() string {
 		} else {
 			filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
 		}
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "Shift+↑↓" + reset + " Multi-select  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete" + filterHint + "  " + scrollIndicator + "\n"
+		content += "  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "Shift+↑↓" + reset + " Multi-select  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete" + filterHint + "  " + scrollIndicator + "\n"
 
 	case "nodes":
 		// Header

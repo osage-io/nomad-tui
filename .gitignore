@@ -14,3 +14,6 @@ nomad-local/
 # OS-specific files
 .DS_Store
 Thumbs.db
+
+# Build/install artifacts
+install
