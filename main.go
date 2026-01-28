@@ -85,7 +85,10 @@ type model struct {
 	theme                Theme
 	confirmAction        string
 	confirmJob           *jobStats
+	confirmJobs          []*jobStats // for multi-job operations (delete multiple jobs)
 	confirmAlloc         *api.AllocationListStub
+	selectionAnchor      int                 // anchor index for shift+selection range
+	selectedJobIDs       map[string]struct{} // tracks multi-selected job IDs
 	logContent           string
 	logJobName           string
 	logAllocID           string
@@ -124,6 +127,127 @@ type jobEvent struct {
 	Task    string
 	Type    string
 	Message string
+}
+
+// --- Multi-selection helper functions ---
+
+// ensureSelectedJobMap initializes the selection map if nil
+func (m *model) ensureSelectedJobMap() {
+	if m.selectedJobIDs == nil {
+		m.selectedJobIDs = make(map[string]struct{})
+	}
+}
+
+// selectSingleJob selects only the job at the given filtered index, clearing other selections
+func (m *model) selectSingleJob(idx int) {
+	m.ensureSelectedJobMap()
+	m.selectedJobIDs = make(map[string]struct{})
+	m.selectionAnchor = -1
+
+	if idx < 0 || idx >= len(m.filteredJobs) {
+		return
+	}
+
+	job := m.filteredJobs[idx]
+	if job != nil {
+		m.selectedJobIDs[job.ID] = struct{}{}
+		m.selectionAnchor = idx
+	}
+}
+
+// selectRangeJobs selects all jobs in a range between anchor and current (inclusive)
+func (m *model) selectRangeJobs(anchor, current int) {
+	m.ensureSelectedJobMap()
+
+	if len(m.filteredJobs) == 0 {
+		return
+	}
+
+	// Clamp indices to valid range
+	if anchor < 0 {
+		anchor = 0
+	}
+	if anchor >= len(m.filteredJobs) {
+		anchor = len(m.filteredJobs) - 1
+	}
+	if current < 0 {
+		current = 0
+	}
+	if current >= len(m.filteredJobs) {
+		current = len(m.filteredJobs) - 1
+	}
+
+	// Ensure start <= end
+	start, end := anchor, current
+	if start > end {
+		start, end = end, start
+	}
+
+	// Clear and rebuild selection
+	m.selectedJobIDs = make(map[string]struct{})
+	for i := start; i <= end; i++ {
+		job := m.filteredJobs[i]
+		if job != nil {
+			m.selectedJobIDs[job.ID] = struct{}{}
+		}
+	}
+	m.selectionAnchor = anchor
+}
+
+// pruneSelectedJobs removes jobs from selection that are no longer in the filtered list
+func (m *model) pruneSelectedJobs() {
+	m.ensureSelectedJobMap()
+
+	if len(m.selectedJobIDs) == 0 {
+		return
+	}
+
+	// Build set of valid job IDs from current filtered list
+	valid := make(map[string]struct{})
+	for _, job := range m.filteredJobs {
+		if job == nil {
+			continue
+		}
+		if _, selected := m.selectedJobIDs[job.ID]; selected {
+			valid[job.ID] = struct{}{}
+		}
+	}
+
+	m.selectedJobIDs = valid
+	if len(valid) == 0 {
+		m.selectionAnchor = -1
+	}
+}
+
+// gatherSelectedJobs returns all currently selected jobs, or falls back to cursor position
+func (m *model) gatherSelectedJobs() []*jobStats {
+	m.ensureSelectedJobMap()
+
+	// If we have multi-selections, return them
+	if len(m.selectedJobIDs) > 0 {
+		jobs := make([]*jobStats, 0, len(m.selectedJobIDs))
+		for _, job := range m.filteredJobs {
+			if job == nil {
+				continue
+			}
+			if _, selected := m.selectedJobIDs[job.ID]; selected {
+				jobs = append(jobs, job)
+			}
+		}
+		if len(jobs) > 0 {
+			return jobs
+		}
+	}
+
+	// Fallback: return job at current cursor position
+	if m.selectedIndex >= 0 && m.selectedIndex < len(m.filteredJobs) {
+		job := m.filteredJobs[m.selectedIndex]
+		if job != nil {
+			return []*jobStats{job}
+		}
+	}
+
+	return nil
 }
 
 type serviceInfo struct {
@@ -556,10 +680,38 @@ func startBlockingQuery(client *api.Client, jobsIndex, nodesIndex, servicesIndex
 	}
 }
 
-func deleteJob(client *api.Client, jobID string) tea.Msg {
-	_, _, err := client.Jobs().Deregister(jobID, true, nil)
+func deleteJob(client *api.Client, jobID string, namespace string) tea.Msg {
+	var opts *api.WriteOptions
+	if namespace != "" {
+		opts = &api.WriteOptions{Namespace: namespace}
+	}
+	_, _, err := client.Jobs().Deregister(jobID, true, opts)
 	if err != nil {
 		return errMsg(err)
+	}
+	return refreshMsg{}
+}
+
+// deleteJobs deletes multiple jobs, deduplicating by job ID
+func deleteJobs(client *api.Client, jobs []*jobStats) tea.Msg {
+	seen := make(map[string]struct{})
+	for _, job := range jobs {
+		if job == nil {
+			continue
+		}
+		// Skip duplicates
+		if _, exists := seen[job.ID]; exists {
+			continue
+		}
+		seen[job.ID] = struct{}{}
+
+		// Delete the job with its namespace
+		if msg := deleteJob(client, job.ID, job.Namespace); msg != nil {
+			if _, ok := msg.(errMsg); ok {
+				// Return first error encountered
+				return msg
+			}
+		}
 	}
 	return refreshMsg{}
 }
@@ -1107,21 +1259,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						cmd = tea.Cmd(func() tea.Msg { return restartAlloc(m.client, allocID, "") })
 					}
 					m.confirmAlloc = nil
-				} else if m.confirmJob != nil {
-					// Job actions
-					jobID := m.confirmJob.ID
+				} else if len(m.confirmJobs) > 0 {
+					// Job actions (single or multi)
 					if m.confirmAction == "stop" {
+						// Stop only works for single job
+						jobID := m.confirmJobs[0].ID
 						cmd = tea.Cmd(func() tea.Msg { return stopJob(m.client, jobID) })
-					} else {
-						cmd = tea.Cmd(func() tea.Msg { return deleteJob(m.client, jobID) })
+					} else if m.confirmAction == "delete" {
+						// Delete can handle multiple jobs
+						jobs := m.confirmJobs
+						cmd = tea.Cmd(func() tea.Msg { return deleteJobs(m.client, jobs) })
 					}
-					m.confirmJob = nil
+					m.confirmJobs = nil
 				}
 				m.confirmAction = ""
 				return m, cmd
 			case "n", "N", "esc":
 				m.confirmAction = ""
 				m.confirmJob = nil
+				m.confirmJobs = nil
 				m.confirmAlloc = nil
 				return m, nil
 			}
@@ -1349,9 +1505,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			m.view = "cluster"
 			m.scrollOffset = 0
+		case "shift+up":
+			// Multi-select: extend selection upward
+			if m.view == "jobs" && m.selectedIndex > 0 {
+				if m.selectionAnchor < 0 {
+					m.selectionAnchor = m.selectedIndex
+				}
+				m.selectedIndex--
+				m.selectRangeJobs(m.selectionAnchor, m.selectedIndex)
+				if m.selectedIndex < m.jobsScrollOffset {
+					m.jobsScrollOffset = m.selectedIndex
+				}
+			}
 		case "up":
 			if m.view == "jobs" && m.selectedIndex > 0 {
 				m.selectedIndex--
+				m.selectSingleJob(m.selectedIndex)
 				// Scroll up if selection is above visible area
 				if m.selectedIndex < m.jobsScrollOffset {
 					m.jobsScrollOffset = m.selectedIndex
@@ -1397,6 +1566,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Disable follow mode when manually scrolling
 				m.logsFollowMode = false
 			}
+		case "shift+down":
+			// Multi-select: extend selection downward
+			if m.view == "jobs" {
+				maxJobs := len(m.filteredJobs)
+				if maxJobs == 0 {
+					maxJobs = len(m.jobs)
+				}
+				if m.selectedIndex < maxJobs-1 {
+					if m.selectionAnchor < 0 {
+						m.selectionAnchor = m.selectedIndex
+					}
+					m.selectedIndex++
+					m.selectRangeJobs(m.selectionAnchor, m.selectedIndex)
+					if m.height > 0 {
+						chromeLines := 15
+						maxVisibleJobs := m.height - chromeLines
+						if maxVisibleJobs < 1 {
+							maxVisibleJobs = 1
+						}
+						scrollBuffer := 2
+						if m.selectedIndex >= m.jobsScrollOffset+maxVisibleJobs-scrollBuffer {
+							m.jobsScrollOffset = m.selectedIndex - maxVisibleJobs + scrollBuffer + 1
+						}
+					}
+				}
+			}
 		case "down":
 			if m.view == "jobs" {
 				maxJobs := len(m.filteredJobs)
@@ -1405,6 +1600,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.selectedIndex < maxJobs-1 {
 					m.selectedIndex++
+					m.selectSingleJob(m.selectedIndex)
 					// Calculate max visible jobs (same formula as in View)
 					// Chrome = 15 lines (10 before table + 5 after)
 					if m.height > 0 {
@@ -1499,10 +1695,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "s":
 			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
-				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
-				if originalIndex >= 0 && originalIndex < len(m.jobs) {
+				jobs := m.gatherSelectedJobs()
+				if len(jobs) == 1 {
 					m.confirmAction = "stop"
-					m.confirmJob = m.jobs[originalIndex]
+					m.confirmJobs = jobs
 				}
 			} else if m.view == "job-status" && m.selectedJobIndex >= 0 && m.selectedJobIndex < len(m.jobs) && m.confirmAction == "" {
 				selectedJob := m.jobs[m.selectedJobIndex]
@@ -1521,10 +1717,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			if m.view == "jobs" && len(m.filteredJobs) > 0 && m.confirmAction == "" {
-				originalIndex := m.getOriginalJobIndex(m.selectedIndex)
-				if originalIndex >= 0 && originalIndex < len(m.jobs) {
+				jobs := m.gatherSelectedJobs()
+				if len(jobs) > 0 {
 					m.confirmAction = "delete"
-					m.confirmJob = m.jobs[originalIndex]
+					m.confirmJobs = jobs
 				}
 			}
 		case "i":
@@ -1736,6 +1932,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filteredJobs = m.buildFilteredJobs()
 		m.filteredNodes = m.buildFilteredNodes()
 		m.filteredServices = m.buildFilteredServices()
+
+		// Prune stale job selections after data refresh
+		m.pruneSelectedJobs()
 
 		// Update blocking query indices
 		m.jobsIndex = msg.jobsIndex
@@ -2401,8 +2600,13 @@ func (m model) View() string {
 			// Job name with selection highlight and filter highlighting
 			name := truncate(job.Name, colName-2)
 			var nameField string
+			_, isMultiSelected := m.selectedJobIDs[job.ID]
 			if i == m.selectedIndex {
+				// Cursor position - use primary highlight
 				nameField = bold + m.theme.HighlightBg + "\033[30m" + fmt.Sprintf(" %-*s", colName-1, name) + reset
+			} else if isMultiSelected {
+				// Multi-selected but not cursor - use secondary highlight (dimmed blue)
+				nameField = "\033[48;5;17m\033[37m" + fmt.Sprintf(" %-*s", colName-1, name) + reset
 			} else {
 				// Apply filter highlighting if filter is active
 				if m.filterInput != "" {
@@ -2456,7 +2660,7 @@ func (m model) View() string {
 		} else {
 			filterHint = "  " + dimmed + "│" + reset + "  " + cyan + "/" + reset + " Filter"
 		}
-		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "←→" + reset + " Switch View  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete" + filterHint + "  " + scrollIndicator + "\n"
+		content += "\n  " + dimmed + "↑↓" + reset + " Navigate  " + dimmed + "│" + reset + "  " + dimmed + "Shift+↑↓" + reset + " Multi-select  " + dimmed + "│" + reset + "  " + cyan + "Enter" + reset + " Details  " + dimmed + "│" + reset + "  " + cyan + "s" + reset + " Stop  " + dimmed + "│" + reset + "  " + cyan + "d" + reset + " Delete" + filterHint + "  " + scrollIndicator + "\n"
 
 	case "nodes":
 		// Header
@@ -4001,10 +4205,14 @@ func (m model) View() string {
 				actionName = "restart"
 			}
 			message = fmt.Sprintf("Are you sure you want to %s allocation '%s'?", actionName, allocShort)
-		} else if m.confirmJob != nil {
+		} else if len(m.confirmJobs) > 0 {
 			// Job action confirmation
 			action := strings.Title(m.confirmAction)
-			message = fmt.Sprintf("Are you sure you want to %s job '%s'?", action, m.confirmJob.Name)
+			if len(m.confirmJobs) == 1 {
+				message = fmt.Sprintf("Are you sure you want to %s job '%s'?", action, m.confirmJobs[0].Name)
+			} else {
+				message = fmt.Sprintf("Are you sure you want to %s %d jobs?", action, len(m.confirmJobs))
+			}
 		}
 
 		// Create a centered modal dialog box
